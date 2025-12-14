@@ -325,18 +325,6 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
       - Periodic adsk.doEvents()
     """
     root = design.rootComponent
-
-    # ----------------------------
-    # Sheet classes (mm)
-    # ----------------------------
-    # name, width_mm, height_mm
-    SHEET_CLASSES = [
-        ("STD_4x8",   2438.4, 1219.2),
-        ("EXT_4x10",  2438.4, 3048.0),
-        ("EXT_4x12",  2438.4, 3657.6),
-        ("WIDE_6x10", 1828.8, 3048.0),
-    ]
-
     # ----------------------------
     # Safe translation-only move (self-contained)
     # ----------------------------
@@ -589,6 +577,8 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         return None
 
     def _pick_best_sheet_and_rot(fp0, fp1):
+        local_order = {cname: i for i, (cname, _sw, _sh) in enumerate(SHEET_CLASSES)}
+
         # Try 4x8 first
         for rot in ([False, True] if allow_rotate_90 else [False]):
             fp = fp1 if rot else fp0
@@ -606,7 +596,7 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                 continue
             ok = _best_class_for_dims(fp[0], fp[1])
             if ok:
-                candidates.append((class_order.get(ok[0], 999), ok, rot))
+                candidates.append((local_order.get(ok[0], 999), ok, rot))
 
         if not candidates:
             return None, False
@@ -807,7 +797,7 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         failures_move = []
 
         while remaining:
-            sheet_name = f"{layout_base_name}_{class_name}_{sheet_index:02d}"
+            sheet_name = f"SHEET_{sheet_index:02d}_{class_name}"
             sheet_occ = _ensure_component_occurrence(root, sheet_name)
             sheet_comp = sheet_occ.component
 
@@ -875,7 +865,7 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
 
                     # Rename inserted body to match source
                     try:
-                        nb.name = name
+                        nb.name = name.replace("Layer_", "L").replace("_part_", "_P")
                     except:
                         pass
 
