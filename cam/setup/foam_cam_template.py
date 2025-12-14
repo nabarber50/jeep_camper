@@ -20,6 +20,13 @@ USE_VISIBLE_BODIES_ONLY = True
 DO_AUTO_LAYOUT = True
 LAYOUT_BASE_NAME = 'SHEET_LAYOUT_4x8'
 
+SHEET_CLASSES = [
+    ("STD_4x8",   1219.2, 2438.4),
+    ("EXT_4x10",  1219.2, 3048.0),
+    ("EXT_4x12",  1219.2, 3657.6),
+    ("WIDE_6x10", 1828.8, 3048.0),
+]
+
 SHEET_W   = '2438.4 mm'     # 8 ft (X)
 SHEET_H   = '1219.2 mm'     # 4 ft (Y)
 SHEET_THK = '38.1 mm'       # foam thickness
@@ -301,29 +308,42 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                                           allow_rotate_90: bool,
                                           hide_originals: bool):
     """
-    Packs slice solid bodies onto as many sheets as needed.
+    Multi-sheet-class nesting:
+      - Defines multiple sheet classes (STD_4x8, EXT_4x10, EXT_4x12, WIDE_6x10).
+      - Each body is assigned to the smallest class that can fit (considering optional 90° rotation).
+      - Runs the same stable packer per class, producing multiple sheets per class as needed.
 
-    Key behaviors:
-      - Collects solids; if USE_VISIBLE_BODIES_ONLY=True, still includes bodies whose name contains 'Layer_' (even if hidden).
-      - Footprints computed from TEMP flatten; sanity-checked vs bbox; fallback to bbox if TEMP is implausibly small.
-      - Prefers TEMP insert for FINAL (preserves rotate+flatten-to-Z0 cookie-cutter). copyToComponent is fallback for rot=False.
-      - One BaseFeature per sheet for TEMP inserts (stability).
-      - Translation-only moves (MoveFeatures).
-      - Skip oversize bodies.
-      - Do NOT eliminate bodies as “probe failed” unless we actually attempted a probe.
-      - If it fits the sheet overall but not remaining space on this sheet, defer to next sheet (so additional sheets are created).
-      - Renames inserted bodies to match source body name for traceability.
+    Preserves previously agreed stability rules:
+      - Collector diagnostics + includes hidden bodies with 'Layer_' in name even if USE_VISIBLE_BODIES_ONLY=True
+      - TEMP flatten footprint with sanity-check vs bbox; fallback to bbox if TEMP footprint implausible
+      - Prefer TEMP insert for FINAL (rotation + flatten-to-Z0 cookie-cutter); copyToComponent fallback for rot=False
+      - One BaseFeature per sheet for TEMP inserts
+      - Translation-only moves
+      - Skip oversize bodies (relative to all classes)
+      - Do not mark probe failed unless probe was attempted (defer to next sheet if just no remaining space)
+      - Rename inserted bodies to match source name
+      - Periodic adsk.doEvents()
     """
     root = design.rootComponent
 
     # ----------------------------
-    # Safe translation-only move (self-contained, no NameError)
+    # Sheet classes (mm)
+    # ----------------------------
+    # name, width_mm, height_mm
+    SHEET_CLASSES = [
+        ("STD_4x8",   2438.4, 1219.2),
+        ("EXT_4x10",  2438.4, 3048.0),
+        ("EXT_4x12",  2438.4, 3657.6),
+        ("WIDE_6x10", 1828.8, 3048.0),
+    ]
+
+    # ----------------------------
+    # Safe translation-only move (self-contained)
     # ----------------------------
     def _move_translate_only(comp: adsk.fusion.Component,
                              body: adsk.fusion.BRepBody,
                              tx_mm: float, ty_mm: float, tz_mm: float):
-        # Fusion internal distance is cm; mm -> cm = *0.1
-        dx = tx_mm * 0.1
+        dx = tx_mm * 0.1  # mm -> cm
         dy = ty_mm * 0.1
         dz = tz_mm * 0.1
         mv_feats = comp.features.moveFeatures
@@ -335,85 +355,179 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         mv_feats.add(inp)
 
     # ----------------------------
-    # Evaluate sheet geometry in mm
+    # Evaluate parameters in mm (margin/gap are shared across classes)
     # ----------------------------
-    sheet_w = _eval_mm(design, sheet_w_expr)
-    sheet_h = _eval_mm(design, sheet_h_expr)
+    # NOTE: sheet_w_expr/sheet_h_expr remain accepted but are not used for sizing now,
+    # since we are using explicit sheet classes above. We still eval them to keep behavior
+    # consistent if other parts of the script expect eval side effects/logs.
+    _ = _eval_mm(design, sheet_w_expr)
+    _ = _eval_mm(design, sheet_h_expr)
     margin = _eval_mm(design, margin_expr)
     gap = _eval_mm(design, gap_expr)
 
-    usable_w = sheet_w - 2.0 * margin
-    usable_h = sheet_h - 2.0 * margin
-    if usable_w <= 0 or usable_h <= 0:
-        ui.messageBox(
-            "Invalid sheet usable area.\n\n"
-            f"Sheet: {sheet_w:.1f} x {sheet_h:.1f} mm\n"
-            f"Margin: {margin:.1f} mm\n"
-            "Reduce margin or increase sheet size."
-        )
-        return []
-
     # ----------------------------
-    # Collect bodies (includes hidden Layer_* when USE_VISIBLE_BODIES_ONLY=True)
+    # Collector with diagnostics
     # ----------------------------
-    def _collect_slice_solids_including_hidden_layers(design_: adsk.fusion.Design):
+    def _collect_slice_solids_with_diagnostics(design_: adsk.fusion.Design):
         r = design_.rootComponent
-        out = []
+        included = []
 
-        def _want_body(b):
-            if not b or (not b.isSolid):
+        stats = {
+            "seen_total": 0,
+            "seen_root": 0,
+            "seen_occ": 0,
+            "non_brep_or_null": 0,
+            "not_solid": 0,
+            "filtered_visibility": 0,
+            "included": 0,
+            "deduped_out": 0,
+        }
+        excluded_samples = []  # (name, reason, where)
+
+        def _record_excluded(b, reason: str, where: str):
+            nm = "(unnamed)"
+            try:
+                nm = (getattr(b, "name", "") or nm)
+            except:
+                pass
+            if len(excluded_samples) < 60:
+                excluded_samples.append((nm, reason, where))
+
+        def _want_body(b, where: str):
+            stats["seen_total"] += 1
+            if where == "root":
+                stats["seen_root"] += 1
+            else:
+                stats["seen_occ"] += 1
+
+            if not b:
+                stats["non_brep_or_null"] += 1
+                _record_excluded(b, "null body", where)
                 return False
+
+            try:
+                if not hasattr(b, "isSolid"):
+                    stats["non_brep_or_null"] += 1
+                    _record_excluded(b, "not a BRepBody", where)
+                    return False
+            except:
+                stats["non_brep_or_null"] += 1
+                _record_excluded(b, "not a BRepBody", where)
+                return False
+
+            try:
+                if not b.isSolid:
+                    stats["not_solid"] += 1
+                    _record_excluded(b, "not solid (surface body)", where)
+                    return False
+            except:
+                stats["not_solid"] += 1
+                _record_excluded(b, "isSolid check failed", where)
+                return False
+
             nm = (getattr(b, "name", "") or "")
             is_layer_named = ("layer_" in nm.lower())
-            if USE_VISIBLE_BODIES_ONLY and (not b.isVisible) and (not is_layer_named):
-                return False
+
+            if USE_VISIBLE_BODIES_ONLY:
+                try:
+                    if (not b.isVisible) and (not is_layer_named):
+                        stats["filtered_visibility"] += 1
+                        _record_excluded(b, "hidden (and not Layer_*)", where)
+                        return False
+                except:
+                    pass
+
             return True
 
         # root bodies
         try:
             for b in r.bRepBodies:
-                if _want_body(b):
-                    out.append(b)
+                if _want_body(b, "root"):
+                    included.append(b)
         except:
             pass
 
-        # occurrence bodies (may be proxies)
+        # occurrence bodies (proxies)
         try:
             for occ in r.allOccurrences:
                 comp = occ.component
                 if not comp:
                     continue
                 for b in comp.bRepBodies:
-                    if not _want_body(b):
+                    if not _want_body(b, "occ"):
                         continue
                     try:
-                        out.append(b.createForAssemblyContext(occ))
+                        included.append(b.createForAssemblyContext(occ))
                     except:
-                        out.append(b)
+                        included.append(b)
         except:
             pass
 
-        # dedupe by native
+        # proxy-aware dedupe:
+        # - keep proxies unique (key by proxy id)
+        # - dedupe natives by native id
         dedup = []
         seen = set()
-        for b in out:
+        for b in included:
             try:
-                k = id(_resolve_native(b))
+                is_proxy = (hasattr(b, "assemblyContext") and b.assemblyContext is not None)
             except:
-                k = id(b)
-            if k not in seen:
-                seen.add(k)
-                dedup.append(b)
-        return dedup
+                is_proxy = False
 
-    bodies = _collect_slice_solids_including_hidden_layers(design)
+            if is_proxy:
+                k = ("proxy", id(b))
+            else:
+                try:
+                    k = ("native", id(_resolve_native(b)))
+                except:
+                    k = ("native", id(b))
+
+            if k in seen:
+                stats["deduped_out"] += 1
+                continue
+            seen.add(k)
+            dedup.append(b)
+
+        stats["included"] = len(dedup)
+        return dedup, stats, excluded_samples
+
+    bodies, diag_stats, diag_excluded = _collect_slice_solids_with_diagnostics(design)
+
+    try:
+        log("Collector diagnostics:")
+        log(f"  seen_total={diag_stats['seen_total']} (root={diag_stats['seen_root']}, occ={diag_stats['seen_occ']})")
+        log(f"  included={diag_stats['included']} deduped_out={diag_stats['deduped_out']}")
+        log(f"  excluded_not_solid={diag_stats['not_solid']}")
+        log(f"  excluded_hidden={diag_stats['filtered_visibility']}")
+        log(f"  excluded_non_brep_or_null={diag_stats['non_brep_or_null']}")
+        if diag_excluded:
+            log("  First excluded samples (name | reason | where):")
+            for nm, reason, where in diag_excluded[:20]:
+                log(f"    - {nm} | {reason} | {where}")
+    except:
+        pass
+
     if not bodies:
         ui.messageBox(
-            "No eligible solid bodies found to layout.\n\n"
-            "If USE_VISIBLE_BODIES_ONLY=True, bodies must be Visible\n"
-            "OR have 'Layer_' in the name (even if hidden)."
+            "No eligible BRep solid bodies found to layout.\n\n"
+            "Check the log for 'Collector diagnostics' to see why bodies were excluded."
         )
         return []
+
+    try:
+        if diag_stats["included"] < 5:
+            preview = "\n".join([f"- {nm} | {reason} | {where}" for (nm, reason, where) in diag_excluded[:10]])
+            ui.messageBox(
+                "Body collection diagnostics (included < 5):\n\n"
+                f"seen_total={diag_stats['seen_total']} (root={diag_stats['seen_root']}, occ={diag_stats['seen_occ']})\n"
+                f"included={diag_stats['included']}  deduped_out={diag_stats['deduped_out']}\n"
+                f"excluded_not_solid={diag_stats['not_solid']}\n"
+                f"excluded_hidden={diag_stats['filtered_visibility']}\n"
+                f"excluded_non_brep_or_null={diag_stats['non_brep_or_null']}\n\n"
+                "First excluded:\n" + (preview if preview else "(none)")
+            )
+    except:
+        pass
 
     # ----------------------------
     # Footprint helpers
@@ -429,7 +543,6 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             return None
 
     def _sanitized_footprint_mm(src_body, rot_90: bool):
-        """Prefer TEMP flatten footprint, sanity-check vs bbox; fallback to bbox if TEMP is implausibly small."""
         name = getattr(src_body, "name", "(unnamed)")
         bb = _bbox_footprint_mm(src_body, rot_90)
         tmp = _tmp_flatten_and_measure_footprint_mm(src_body, rot_90)
@@ -462,7 +575,21 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         return tmp
 
     # ----------------------------
-    # Build items list + oversize skip
+    # Sheet-class chooser
+    # ----------------------------
+    def _usable_for_class(sw_mm: float, sh_mm: float):
+        return (sw_mm - 2.0 * margin, sh_mm - 2.0 * margin)
+
+    def _best_class_for_dims(w_mm: float, h_mm: float):
+        # returns (class_name, sheet_w_mm, sheet_h_mm, usable_w, usable_h)
+        for cname, sw, sh in SHEET_CLASSES:
+            uw, uh = _usable_for_class(sw, sh)
+            if w_mm <= uw and h_mm <= uh:
+                return (cname, sw, sh, uw, uh)
+        return None
+
+    # ----------------------------
+    # Build items list, assign sheet class, skip true oversize
     # ----------------------------
     skipped = []
     items = []
@@ -475,38 +602,104 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             skipped.append(f"{name} (missing footprint)")
             continue
 
-        fits0 = (fp0[0] <= usable_w and fp0[1] <= usable_h)
-        fits1 = False
-        if fp1:
-            fits1 = (fp1[0] <= usable_w and fp1[1] <= usable_h)
+        try:
+            # Real bbox of the native body (no temp flatten)
+            n = _resolve_native(b)
+            x0,y0,z0,x1,y1,z1 = _bbox_mm(n)
+            bw = abs(x1-x0)
+            bh = abs(y1-y0)
+            bz = abs(z1-z0)
+            log(f"SIZE CHECK native bbox: {name} -> W={bw:.1f}mm H={bh:.1f}mm Z={bz:.1f}mm")
+        except:
+            pass
 
-        if not (fits0 or fits1):
-            skipped.append(f"{name} ({fp0[0]:.1f} x {fp0[1]:.1f} mm)")
+        best = _best_class_for_dims(fp0[0], fp0[1])
+        best_rot = False
+
+        if allow_rotate_90 and fp1:
+            alt = _best_class_for_dims(fp1[0], fp1[1])
+            # choose the smaller sheet class (first in SHEET_CLASSES)
+            if alt and (not best or SHEET_CLASSES.index((alt[0], alt[1], alt[2])) < SHEET_CLASSES.index((best[0], best[1], best[2]))):
+                best = alt
+                best_rot = True
+
+        if not best:
+            # too big for ALL classes
+            skipped.append(f"{name} ({fp0[0]:.1f} x {fp0[1]:.1f} mm) too large for all sheet classes")
             continue
 
-        items.append({"body": b, "name": name, "fp0": fp0, "fp1": fp1})
+        items.append({
+            "body": b,
+            "name": name,
+            "fp0": fp0,
+            "fp1": fp1,
+            "sheet_class": best[0],
+            "sheet_w": best[1],
+            "sheet_h": best[2],
+            "usable_w": best[3],
+            "usable_h": best[4],
+            "prefer_rot": best_rot
+        })
 
     if not items:
         ui.messageBox(
-            "Nothing can fit on the usable sheet area.\n\n"
-            f"Usable area: {usable_w:.1f} x {usable_h:.1f} mm\n"
-            f"Rotate 90°: {'ON' if allow_rotate_90 else 'OFF'}\n\n"
-            "First few skipped:\n" + "\n".join(skipped[:15])
+            "Nothing eligible to layout.\n\n"
+            "All bodies were skipped (oversize/missing footprint)."
         )
         return []
 
-    items.sort(key=lambda it: max(it["fp0"][0], it["fp0"][1]), reverse=True)
+    # ----------------------------
+    # Group by sheet class
+    # ----------------------------
+    try:
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for it in items:
+            groups[it["sheet_class"]].append(it)
+    except:
+        groups = {}
+        for it in items:
+            groups.setdefault(it["sheet_class"], []).append(it)
+
+    # Sort groups by sheet class order (smallest first)
+    class_order = {cname: i for i, (cname, _sw, _sh) in enumerate(SHEET_CLASSES)}
+    class_names_sorted = sorted(groups.keys(), key=lambda k: class_order.get(k, 999))
+
+    # Within each class, sort largest-first (stable shelf packing)
+    for cn in class_names_sorted:
+        groups[cn].sort(key=lambda it: max(it["fp0"][0], it["fp0"][1]), reverse=True)
+
     originals_for_hiding = [it["body"] for it in items]
-    try: log(f"Auto layout: items={len(items)} skipped={len(skipped)}")
-    except: pass
+
+    try:
+        log(f"Auto layout: total items={len(items)} skipped={len(skipped)}")
+        for cn in class_names_sorted:
+            log(f"  class {cn}: {len(groups[cn])} items")
+    except:
+        pass
 
     # ----------------------------
-    # Probe cache: (native_id, rot) -> "temp" / "copy" / ""
+    # Probe cache: (key, rot) -> "temp" / "copy" / ""
+    # NOTE: because proxies can be unique, cache key uses:
+    #   - proxies: id(body)
+    #   - natives: id(native)
     # ----------------------------
     probe_cache = {}
 
+    def _probe_key_for_body(src_body):
+        try:
+            is_proxy = (hasattr(src_body, "assemblyContext") and src_body.assemblyContext is not None)
+        except:
+            is_proxy = False
+        if is_proxy:
+            return ("proxy", id(src_body))
+        try:
+            return ("native", id(_resolve_native(src_body)))
+        except:
+            return ("native", id(src_body))
+
     def _probe_method(src_body, sheet_occ, rot_90: bool, base_feat: adsk.fusion.BaseFeature):
-        ck = (id(_resolve_native(src_body)), bool(rot_90))
+        ck = (_probe_key_for_body(src_body), bool(rot_90))
         if ck in probe_cache:
             return probe_cache[ck]
 
@@ -530,7 +723,7 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             except: pass
             return ""
 
-        # rot=False: prefer TEMP first (preserves cookie-cutter flatten behavior), then fallback copyToComponent
+        # rot=False: prefer TEMP first, fallback copyToComponent
         nb = _copy_body_to_component_via_temp(design, src_body, sheet_occ, rotate_90=False, base_feat=base_feat)
         if nb:
             try: nb.deleteMe()
@@ -564,7 +757,8 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         except: pass
 
         if method == "temp":
-            return _copy_body_to_component_via_temp(design, src_body, sheet_occ, rotate_90=bool(rot_90), base_feat=base_feat)
+            return _copy_body_to_component_via_temp(design, src_body, sheet_occ,
+                                                    rotate_90=bool(rot_90), base_feat=base_feat)
 
         if method == "copy":
             try:
@@ -576,148 +770,182 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         return None
 
     # ----------------------------
-    # Multi-sheet shelf packing
+    # Packing routine for one class
     # ----------------------------
-    sheets = []
-    remaining = list(items)
-    sheet_index = 1
+    def _pack_class(class_name: str, class_items: list, sheet_w_mm: float, sheet_h_mm: float):
+        usable_w, usable_h = _usable_for_class(sheet_w_mm, sheet_h_mm)
+        sheets_local = []
 
-    failures_probe = []
-    failures_insert = []
-    failures_move = []
+        remaining = list(class_items)
+        sheet_index = 1
 
-    while remaining:
-        sheet_name = f"{layout_base_name}_{sheet_index:02d}"
-        sheet_occ = _ensure_component_occurrence(root, sheet_name)
-        sheet_comp = sheet_occ.component
+        failures_probe = []
+        failures_insert = []
+        failures_move = []
 
-        # One BaseFeature per sheet for TEMP inserts
-        sheet_base_feat = None
-        try:
-            sheet_base_feat = sheet_comp.features.baseFeatures.add()
-            sheet_base_feat.startEdit()
-        except:
+        while remaining:
+            sheet_name = f"{layout_base_name}_{class_name}_{sheet_index:02d}"
+            sheet_occ = _ensure_component_occurrence(root, sheet_name)
+            sheet_comp = sheet_occ.component
+
+            # One BaseFeature per sheet for TEMP inserts
             sheet_base_feat = None
+            try:
+                sheet_base_feat = sheet_comp.features.baseFeatures.add()
+                sheet_base_feat.startEdit()
+            except:
+                sheet_base_feat = None
 
-        try: log(f"--- SHEET START {sheet_name} remaining={len(remaining)} ---")
-        except: pass
+            try: log(f"--- SHEET START {sheet_name} remaining={len(remaining)} usable={usable_w:.1f}x{usable_h:.1f} ---")
+            except: pass
 
-        x = 0.0
-        y = 0.0
-        row_h = 0.0
-        placed_any = False
-        next_remaining = []
+            x = 0.0
+            y = 0.0
+            row_h = 0.0
+            placed_any = False
+            next_remaining = []
 
-        for idx, it in enumerate(remaining):
-            if idx % 10 == 0:
-                try: adsk.doEvents()
-                except: pass
-
-            b = it["body"]
-            name = it["name"]
-            fp0 = it["fp0"]
-            fp1 = it["fp1"]
-
-            tries = [(False, fp0[0], fp0[1])]
-            if allow_rotate_90 and fp1:
-                tries.append((True, fp1[0], fp1[1]))
-
-            placed_this = False
-            probed_any = False  # only becomes True after we actually attempt a probe
-
-            for rot, w, h in tries:
-                # should already be filtered, but keep it safe
-                if w > usable_w or h > usable_h:
-                    continue
-
-                # new row if needed
-                if x > 0.0 and (x + w) > usable_w:
-                    x = 0.0
-                    y += row_h + gap
-                    row_h = 0.0
-
-                # if no vertical space left on this sheet, try next orientation or defer later
-                if (y + h) > usable_h:
-                    continue
-
-                # Now it fits spatially -> NOW probe
-                method = _probe_method(b, sheet_occ, rot, sheet_base_feat)
-                probed_any = True
-                if not method:
-                    continue
-
-                nb = _final_insert(b, sheet_occ, rot, method, sheet_base_feat)
-                if not nb:
-                    failures_insert.append(f"{name}: final insert failed (rot={rot}, method={method})")
-                    continue
-
-                # Rename inserted body to match source
-                try:
-                    nb.name = name
-                except:
-                    pass
-
-                # translate-only placement: to margin+(x,y), and drop to Z=0 (cookie-cutter)
-                x0, y0, z0, x1, y1, z1 = _bbox_mm(nb)
-                tx = (margin + x) - min(x0, x1)
-                ty = (margin + y) - min(y0, y1)
-                tz = -max(z0, z1)
-
-                try:
-                    _move_translate_only(sheet_comp, nb, tx, ty, tz)
-                except Exception as e:
-                    try: nb.deleteMe()
+            for idx, it in enumerate(remaining):
+                if idx % 10 == 0:
+                    try: adsk.doEvents()
                     except: pass
-                    failures_move.append(f"{name}: move failed ({str(e)})")
-                    continue
 
-                x += w + gap
-                row_h = max(row_h, h)
-                placed_any = True
-                placed_this = True
-                break
+                b = it["body"]
+                name = it["name"]
+                fp0 = it["fp0"]
+                fp1 = it["fp1"]
 
-            if not placed_this:
-                # If we never probed (because it simply didn't fit remaining space on this sheet),
-                # defer it to the next sheet.
-                if not probed_any:
-                    next_remaining.append(it)
+                # Try preferred rotation first (helps route to smallest class)
+                tries = []
+                if it.get("prefer_rot", False) and allow_rotate_90 and fp1:
+                    tries.append((True, fp1[0], fp1[1]))
+                    tries.append((False, fp0[0], fp0[1]))
                 else:
-                    # We probed but couldn't get an insert method to work for any orientation -> eliminate
-                    failures_probe.append(f"{name}: probe failed (all orientations)")
+                    tries.append((False, fp0[0], fp0[1]))
+                    if allow_rotate_90 and fp1:
+                        tries.append((True, fp1[0], fp1[1]))
 
-        # Close BaseFeature edit for this sheet
-        try:
-            if sheet_base_feat:
-                sheet_base_feat.finishEdit()
-        except:
-            pass
+                placed_this = False
+                probed_any = False
 
-        if placed_any:
-            sheets.append(sheet_occ)
-            remaining = next_remaining
-            sheet_index += 1
+                for rot, w, h in tries:
+                    if w > usable_w or h > usable_h:
+                        continue
+
+                    if x > 0.0 and (x + w) > usable_w:
+                        x = 0.0
+                        y += row_h + gap
+                        row_h = 0.0
+
+                    if (y + h) > usable_h:
+                        continue
+
+                    method = _probe_method(b, sheet_occ, rot, sheet_base_feat)
+                    probed_any = True
+                    if not method:
+                        continue
+
+                    nb = _final_insert(b, sheet_occ, rot, method, sheet_base_feat)
+                    if not nb:
+                        failures_insert.append(f"{name}: final insert failed (rot={rot}, method={method})")
+                        continue
+
+                    # Rename inserted body to match source
+                    try:
+                        nb.name = name
+                    except:
+                        pass
+
+                    # Translate-only placement + drop to Z=0
+                    x0, y0, z0, x1, y1, z1 = _bbox_mm(nb)
+                    tx = (margin + x) - min(x0, x1)
+                    ty = (margin + y) - min(y0, y1)
+                    tz = -max(z0, z1)
+
+                    try:
+                        _move_translate_only(sheet_comp, nb, tx, ty, tz)
+                    except Exception as e:
+                        try: nb.deleteMe()
+                        except: pass
+                        failures_move.append(f"{name}: move failed ({str(e)})")
+                        continue
+
+                    x += w + gap
+                    row_h = max(row_h, h)
+                    placed_any = True
+                    placed_this = True
+                    break
+
+                if not placed_this:
+                    if not probed_any:
+                        next_remaining.append(it)
+                    else:
+                        failures_probe.append(f"{name}: probe failed (all orientations)")
+
+            # Close BaseFeature edit for this sheet
+            try:
+                if sheet_base_feat:
+                    sheet_base_feat.finishEdit()
+            except:
+                pass
+
+            if placed_any:
+                sheets_local.append(sheet_occ)
+                remaining = next_remaining
+                sheet_index += 1
+                continue
+
+            # nothing placed -> stop this class
+            if next_remaining and len(next_remaining) == len(remaining):
+                ui.messageBox(
+                    f"Layout stopped for {class_name}: no bodies could be placed on this sheet.\n\n"
+                    "This typically means Fusion refused insert for remaining bodies.\n"
+                    "Check Desktop log for PROBE/FINAL failures."
+                )
+            else:
+                ui.messageBox(
+                    f"Layout stopped for {class_name}: no bodies could be placed on this sheet.\n\n"
+                    "All remaining bodies were eliminated as unplaceable in this Fusion build.\n\n"
+                    "Check Desktop log for PROBE/FINAL failures."
+                )
+            break
+
+        return sheets_local, failures_probe, failures_insert, failures_move, usable_w, usable_h
+
+    # ----------------------------
+    # Run per class
+    # ----------------------------
+    all_sheets = []
+    all_fail_probe = []
+    all_fail_insert = []
+    all_fail_move = []
+
+    for cn in class_names_sorted:
+        # Get class dims
+        sw = None
+        sh = None
+        for cname, cw, ch in SHEET_CLASSES:
+            if cname == cn:
+                sw, sh = cw, ch
+                break
+        if sw is None or sh is None:
             continue
 
-        # Nothing placed on this sheet:
-        if next_remaining and len(next_remaining) == len(remaining):
-            ui.messageBox(
-                "Layout stopped: no bodies could be placed on this sheet.\n\n"
-                "This typically means Fusion refused insert for remaining bodies.\n"
-                "Check Desktop log for PROBE/FINAL failures."
-            )
-        else:
-            ui.messageBox(
-                "Layout stopped: no bodies could be placed on this sheet.\n\n"
-                "All remaining bodies were eliminated as unplaceable in this Fusion build.\n\n"
-                "Check Desktop log for PROBE/FINAL failures."
-            )
-        break
+        class_sheets, f_probe, f_ins, f_move, uw, uh = _pack_class(cn, groups[cn], sw, sh)
+        all_sheets.extend(class_sheets)
+        all_fail_probe.extend([f"[{cn}] {s}" for s in f_probe])
+        all_fail_insert.extend([f"[{cn}] {s}" for s in f_ins])
+        all_fail_move.extend([f"[{cn}] {s}" for s in f_move])
+
+        try:
+            log(f"Class complete: {cn} -> sheets={len(class_sheets)} usable={uw:.1f}x{uh:.1f}")
+        except:
+            pass
 
     # ----------------------------
     # Visibility handling
     # ----------------------------
-    if hide_originals and sheets:
+    if hide_originals and all_sheets:
         for b in originals_for_hiding:
             try:
                 bb = b.nativeObject if hasattr(b, "nativeObject") and b.nativeObject else b
@@ -725,7 +953,7 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             except:
                 pass
 
-        for occ in sheets:
+        for occ in all_sheets:
             try:
                 for b in occ.component.bRepBodies:
                     if b and b.isSolid:
@@ -738,14 +966,14 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
     # ----------------------------
     msg = [
         "Layout complete.",
-        f"Sheets created: {len(sheets)}",
-        f"Usable per sheet: {usable_w:.1f} x {usable_h:.1f} mm (margin={margin:.1f}mm, gap={gap:.1f}mm)",
+        f"Sheets created: {len(all_sheets)}",
+        f"Margin/gap: {margin:.1f}mm / {gap:.1f}mm",
         f"Rotation: {'ENABLED' if allow_rotate_90 else 'DISABLED'}",
         f"Skipped: {len(skipped)}",
-        f"Probe failures: {len(failures_probe)}",
-        f"Insert failures: {len(failures_insert)}",
-        f"Move failures: {len(failures_move)}",
-        f"Unplaced remaining: {len(remaining)}",
+        f"Probe failures: {len(all_fail_probe)}",
+        f"Insert failures: {len(all_fail_insert)}",
+        f"Move failures: {len(all_fail_move)}",
+        "Sheet classes used: " + (", ".join(class_names_sorted) if class_names_sorted else "(none)"),
     ]
 
     if skipped:
@@ -753,14 +981,18 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         msg.append("First skipped:")
         msg.extend([" - " + s for s in skipped[:10]])
 
-    if failures_probe or failures_insert or failures_move:
+    if all_fail_probe or all_fail_insert or all_fail_move:
         msg.append("")
         msg.append("First failures:")
-        for s in (failures_probe + failures_insert + failures_move)[:10]:
+        for s in (all_fail_probe + all_fail_insert + all_fail_move)[:10]:
             msg.append(" - " + s)
 
     ui.messageBox("\n".join(msg))
-    return sheets
+    try:
+        log(f"Auto layout complete. Sheets: {len(all_sheets)}")
+    except:
+        pass
+    return all_sheets
 
 # ============================================================
 # CAM: STOCK/WCS + OPS
