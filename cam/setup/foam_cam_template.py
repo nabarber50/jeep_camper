@@ -588,6 +588,33 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                 return (cname, sw, sh, uw, uh)
         return None
 
+    def _pick_best_sheet_and_rot(fp0, fp1):
+        # Try 4x8 first
+        for rot in ([False, True] if allow_rotate_90 else [False]):
+            fp = fp1 if rot else fp0
+            if not fp:
+                continue
+            ok = _best_class_for_dims(fp[0], fp[1])
+            if ok and ok[0] == "STD_4x8":
+                return ok, rot
+
+        # Otherwise pick the smallest class that fits (considering both orientations)
+        candidates = []
+        for rot in ([False, True] if allow_rotate_90 else [False]):
+            fp = fp1 if rot else fp0
+            if not fp:
+                continue
+            ok = _best_class_for_dims(fp[0], fp[1])
+            if ok:
+                candidates.append((class_order.get(ok[0], 999), ok, rot))
+
+        if not candidates:
+            return None, False
+
+        candidates.sort(key=lambda t: t[0])  # smallest class first
+        _ord, ok, rot = candidates[0]
+        return ok, rot
+
     # ----------------------------
     # Build items list, assign sheet class, skip true oversize
     # ----------------------------
@@ -613,15 +640,11 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         except:
             pass
 
-        best = _best_class_for_dims(fp0[0], fp0[1])
-        best_rot = False
+        best, best_rot = _pick_best_sheet_and_rot(fp0, fp1)
 
-        if allow_rotate_90 and fp1:
-            alt = _best_class_for_dims(fp1[0], fp1[1])
-            # choose the smaller sheet class (first in SHEET_CLASSES)
-            if alt and (not best or SHEET_CLASSES.index((alt[0], alt[1], alt[2])) < SHEET_CLASSES.index((best[0], best[1], best[2]))):
-                best = alt
-                best_rot = True
+        if not best:
+            skipped.append(f"{name} ({fp0[0]:.1f} x {fp0[1]:.1f} mm) too large for all sheet classes")
+            continue
 
         if not best:
             # too big for ALL classes
