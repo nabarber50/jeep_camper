@@ -292,41 +292,58 @@ def _tmp_flatten_and_measure_footprint_mm(src_body, rot_90: bool):
         return None
 
 def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
-                                           ui: adsk.core.UserInterface,
-                                           layout_base_name: str,
-                                           sheet_w_expr: str,
-                                           sheet_h_expr: str,
-                                           margin_expr: str,
-                                           gap_expr: str,
-                                           allow_rotate_90: bool,
-                                           hide_originals: bool):
+                                          ui: adsk.core.UserInterface,
+                                          layout_base_name: str,
+                                          sheet_w_expr: str,
+                                          sheet_h_expr: str,
+                                          margin_expr: str,
+                                          gap_expr: str,
+                                          allow_rotate_90: bool,
+                                          hide_originals: bool):
     """
-    Packs VISIBLE (slice) solid bodies onto as many sheets as needed.
+    Packs slice solid bodies onto as many sheets as needed.
 
-    Critical fix:
-      - DO NOT eliminate as “probe failed” unless we actually attempted a probe.
-      - If a body fits the sheet in general but doesn't fit remaining space on THIS sheet,
-        defer it to the NEXT sheet (so multiple big slices become sheet_01, sheet_02, ...).
-
-    Build-safe behaviors:
-      - Footprints computed from TEMP flatten, sanity-checked vs native bbox; fallback to bbox if TEMP is implausibly small.
-      - Probe which insert method works (per body+rotation), and FINAL uses that same method.
-      - Rotation only in TEMP insert; MoveFeature is translation-only.
-      - Oversize bodies are skipped (do not stop the run).
-      - Uses an 'items' list so we never lose footprint data due to unstable keys.
+    Key behaviors:
+      - Collects solids; if USE_VISIBLE_BODIES_ONLY=True, still includes bodies whose name contains 'Layer_' (even if hidden).
+      - Footprints computed from TEMP flatten; sanity-checked vs bbox; fallback to bbox if TEMP is implausibly small.
+      - Prefers TEMP insert for FINAL (preserves rotate+flatten-to-Z0 cookie-cutter). copyToComponent is fallback for rot=False.
+      - One BaseFeature per sheet for TEMP inserts (stability).
+      - Translation-only moves (MoveFeatures).
+      - Skip oversize bodies.
+      - Do NOT eliminate bodies as “probe failed” unless we actually attempted a probe.
+      - If it fits the sheet overall but not remaining space on this sheet, defer to next sheet (so additional sheets are created).
+      - Renames inserted bodies to match source body name for traceability.
     """
-
     root = design.rootComponent
 
-    # --- evaluate sheet geometry in mm ---
+    # ----------------------------
+    # Safe translation-only move (self-contained, no NameError)
+    # ----------------------------
+    def _move_translate_only(comp: adsk.fusion.Component,
+                             body: adsk.fusion.BRepBody,
+                             tx_mm: float, ty_mm: float, tz_mm: float):
+        # Fusion internal distance is cm; mm -> cm = *0.1
+        dx = tx_mm * 0.1
+        dy = ty_mm * 0.1
+        dz = tz_mm * 0.1
+        mv_feats = comp.features.moveFeatures
+        objs = adsk.core.ObjectCollection.create()
+        objs.add(body)
+        xform = adsk.core.Matrix3D.create()
+        xform.translation = adsk.core.Vector3D.create(dx, dy, dz)
+        inp = mv_feats.createInput(objs, xform)
+        mv_feats.add(inp)
+
+    # ----------------------------
+    # Evaluate sheet geometry in mm
+    # ----------------------------
     sheet_w = _eval_mm(design, sheet_w_expr)
     sheet_h = _eval_mm(design, sheet_h_expr)
-    margin  = _eval_mm(design, margin_expr)
-    gap     = _eval_mm(design, gap_expr)
+    margin = _eval_mm(design, margin_expr)
+    gap = _eval_mm(design, gap_expr)
 
     usable_w = sheet_w - 2.0 * margin
     usable_h = sheet_h - 2.0 * margin
-
     if usable_w <= 0 or usable_h <= 0:
         ui.messageBox(
             "Invalid sheet usable area.\n\n"
@@ -337,11 +354,65 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         return []
 
     # ----------------------------
-    # Collect bodies
+    # Collect bodies (includes hidden Layer_* when USE_VISIBLE_BODIES_ONLY=True)
     # ----------------------------
-    bodies = _collect_visible_solids(design)
+    def _collect_slice_solids_including_hidden_layers(design_: adsk.fusion.Design):
+        r = design_.rootComponent
+        out = []
+
+        def _want_body(b):
+            if not b or (not b.isSolid):
+                return False
+            nm = (getattr(b, "name", "") or "")
+            is_layer_named = ("layer_" in nm.lower())
+            if USE_VISIBLE_BODIES_ONLY and (not b.isVisible) and (not is_layer_named):
+                return False
+            return True
+
+        # root bodies
+        try:
+            for b in r.bRepBodies:
+                if _want_body(b):
+                    out.append(b)
+        except:
+            pass
+
+        # occurrence bodies (may be proxies)
+        try:
+            for occ in r.allOccurrences:
+                comp = occ.component
+                if not comp:
+                    continue
+                for b in comp.bRepBodies:
+                    if not _want_body(b):
+                        continue
+                    try:
+                        out.append(b.createForAssemblyContext(occ))
+                    except:
+                        out.append(b)
+        except:
+            pass
+
+        # dedupe by native
+        dedup = []
+        seen = set()
+        for b in out:
+            try:
+                k = id(_resolve_native(b))
+            except:
+                k = id(b)
+            if k not in seen:
+                seen.add(k)
+                dedup.append(b)
+        return dedup
+
+    bodies = _collect_slice_solids_including_hidden_layers(design)
     if not bodies:
-        ui.messageBox("No visible solid bodies found to layout.\n\nShow the parts you want to cut, then rerun.")
+        ui.messageBox(
+            "No eligible solid bodies found to layout.\n\n"
+            "If USE_VISIBLE_BODIES_ONLY=True, bodies must be Visible\n"
+            "OR have 'Layer_' in the name (even if hidden)."
+        )
         return []
 
     # ----------------------------
@@ -358,10 +429,7 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             return None
 
     def _sanitized_footprint_mm(src_body, rot_90: bool):
-        """
-        Prefer TEMP flatten footprint, but sanity-check against bbox.
-        If TEMP is implausibly small, fall back to bbox.
-        """
+        """Prefer TEMP flatten footprint, sanity-check vs bbox; fallback to bbox if TEMP is implausibly small."""
         name = getattr(src_body, "name", "(unnamed)")
         bb = _bbox_footprint_mm(src_body, rot_90)
         tmp = _tmp_flatten_and_measure_footprint_mm(src_body, rot_90)
@@ -370,7 +438,8 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             if bb:
                 try: log(f"Footprint FALLBACK(bbox): {name} rot={rot_90} bbox={bb}")
                 except: pass
-            return bb
+                return bb
+            return None
 
         if not bb:
             try: log(f"Footprint TEMP(no bbox): {name} rot={rot_90} tmp={tmp}")
@@ -378,17 +447,14 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             return tmp
 
         tmp_area = max(tmp[0], 0.001) * max(tmp[1], 0.001)
-        bb_area  = max(bb[0], 0.001)  * max(bb[1], 0.001)
+        bb_area = max(bb[0], 0.001) * max(bb[1], 0.001)
         ratio = tmp_area / bb_area
-
         tmp_max = max(tmp[0], tmp[1])
-        bb_max  = max(bb[0], bb[1])
+        bb_max = max(bb[0], bb[1])
 
         if ratio < 0.01 or (tmp_max < 25.0 and bb_max > 100.0):
-            try:
-                log(f"Footprint SANITY->bbox: {name} rot={rot_90} tmp={tmp} bbox={bb} ratio={ratio:.6f}")
-            except:
-                pass
+            try: log(f"Footprint SANITY->bbox: {name} rot={rot_90} tmp={tmp} bbox={bb} ratio={ratio:.6f}")
+            except: pass
             return bb
 
         try: log(f"Footprint TEMP ok: {name} rot={rot_90} tmp={tmp} bbox={bb} ratio={ratio:.6f}")
@@ -400,7 +466,6 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
     # ----------------------------
     skipped = []
     items = []
-
     for b in bodies:
         name = getattr(b, "name", "(unnamed)")
         fp0 = _sanitized_footprint_mm(b, False)
@@ -432,18 +497,15 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
 
     items.sort(key=lambda it: max(it["fp0"][0], it["fp0"][1]), reverse=True)
     originals_for_hiding = [it["body"] for it in items]
-
-    try:
-        log(f"Auto layout: items={len(items)} skipped={len(skipped)}")
-    except:
-        pass
+    try: log(f"Auto layout: items={len(items)} skipped={len(skipped)}")
+    except: pass
 
     # ----------------------------
-    # Probe cache: (native_id, rot) -> "copy" / "temp" / ""
+    # Probe cache: (native_id, rot) -> "temp" / "copy" / ""
     # ----------------------------
     probe_cache = {}
 
-    def _probe_method(src_body, sheet_occ, rot_90: bool) -> str:
+    def _probe_method(src_body, sheet_occ, rot_90: bool, base_feat: adsk.fusion.BaseFeature):
         ck = (id(_resolve_native(src_body)), bool(rot_90))
         if ck in probe_cache:
             return probe_cache[ck]
@@ -454,7 +516,7 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
 
         # rot=True must be TEMP
         if rot_90:
-            nb = _copy_body_to_component_via_temp(design, src_body, sheet_occ, rotate_90=True)
+            nb = _copy_body_to_component_via_temp(design, src_body, sheet_occ, rotate_90=True, base_feat=base_feat)
             if nb:
                 try: nb.deleteMe()
                 except: pass
@@ -468,7 +530,16 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             except: pass
             return ""
 
-        # rot=False: prefer copyToComponent
+        # rot=False: prefer TEMP first (preserves cookie-cutter flatten behavior), then fallback copyToComponent
+        nb = _copy_body_to_component_via_temp(design, src_body, sheet_occ, rotate_90=False, base_feat=base_feat)
+        if nb:
+            try: nb.deleteMe()
+            except: pass
+            probe_cache[ck] = "temp"
+            try: log(f"Probe OK(temp): {name} rot={rot_90}")
+            except: pass
+            return "temp"
+
         try:
             native = _resolve_native(src_body)
             nb2 = native.copyToComponent(sheet_occ)
@@ -482,25 +553,18 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         except:
             pass
 
-        # fallback temp
-        nb = _copy_body_to_component_via_temp(design, src_body, sheet_occ, rotate_90=False)
-        if nb:
-            try: nb.deleteMe()
-            except: pass
-            probe_cache[ck] = "temp"
-            try: log(f"Probe OK(temp): {name} rot={rot_90}")
-            except: pass
-            return "temp"
-
         probe_cache[ck] = ""
         try: log(f"Probe FAIL(all): {name} rot={rot_90}")
         except: pass
         return ""
 
-    def _final_insert(src_body, sheet_occ, rot_90: bool, method: str):
+    def _final_insert(src_body, sheet_occ, rot_90: bool, method: str, base_feat: adsk.fusion.BaseFeature):
         name = getattr(src_body, "name", "(unnamed)")
         try: log(f"Copy start(FINAL): {name} rot={rot_90} method={method}")
         except: pass
+
+        if method == "temp":
+            return _copy_body_to_component_via_temp(design, src_body, sheet_occ, rotate_90=bool(rot_90), base_feat=base_feat)
 
         if method == "copy":
             try:
@@ -508,9 +572,6 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                 return native.copyToComponent(sheet_occ)
             except:
                 return None
-
-        if method == "temp":
-            return _copy_body_to_component_via_temp(design, src_body, sheet_occ, rotate_90=bool(rot_90))
 
         return None
 
@@ -521,14 +582,22 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
     remaining = list(items)
     sheet_index = 1
 
-    failures_probe  = []
+    failures_probe = []
     failures_insert = []
-    failures_move   = []
+    failures_move = []
 
     while remaining:
         sheet_name = f"{layout_base_name}_{sheet_index:02d}"
         sheet_occ = _ensure_component_occurrence(root, sheet_name)
         sheet_comp = sheet_occ.component
+
+        # One BaseFeature per sheet for TEMP inserts
+        sheet_base_feat = None
+        try:
+            sheet_base_feat = sheet_comp.features.baseFeatures.add()
+            sheet_base_feat.startEdit()
+        except:
+            sheet_base_feat = None
 
         try: log(f"--- SHEET START {sheet_name} remaining={len(remaining)} ---")
         except: pass
@@ -536,11 +605,14 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         x = 0.0
         y = 0.0
         row_h = 0.0
-
         placed_any = False
         next_remaining = []
 
-        for it in remaining:
+        for idx, it in enumerate(remaining):
+            if idx % 10 == 0:
+                try: adsk.doEvents()
+                except: pass
+
             b = it["body"]
             name = it["name"]
             fp0 = it["fp0"]
@@ -551,42 +623,48 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                 tries.append((True, fp1[0], fp1[1]))
 
             placed_this = False
-            probed_any = False  # IMPORTANT: only set if we actually try a probe
+            probed_any = False  # only becomes True after we actually attempt a probe
 
             for rot, w, h in tries:
-                # If the part can never fit, it should have been filtered already.
+                # should already be filtered, but keep it safe
                 if w > usable_w or h > usable_h:
                     continue
 
-                # If it doesn't fit in current row, try a new row
+                # new row if needed
                 if x > 0.0 and (x + w) > usable_w:
                     x = 0.0
                     y += row_h + gap
                     row_h = 0.0
 
-                # If it doesn't fit vertically on this sheet anymore, defer to next sheet
+                # if no vertical space left on this sheet, try next orientation or defer later
                 if (y + h) > usable_h:
                     continue
 
-                # Now it fits spatially -> NOW we attempt probe+final
-                method = _probe_method(b, sheet_occ, rot)
+                # Now it fits spatially -> NOW probe
+                method = _probe_method(b, sheet_occ, rot, sheet_base_feat)
                 probed_any = True
                 if not method:
                     continue
 
-                nb = _final_insert(b, sheet_occ, rot, method)
+                nb = _final_insert(b, sheet_occ, rot, method, sheet_base_feat)
                 if not nb:
                     failures_insert.append(f"{name}: final insert failed (rot={rot}, method={method})")
                     continue
 
-                # translate-only placement
+                # Rename inserted body to match source
+                try:
+                    nb.name = name
+                except:
+                    pass
+
+                # translate-only placement: to margin+(x,y), and drop to Z=0 (cookie-cutter)
                 x0, y0, z0, x1, y1, z1 = _bbox_mm(nb)
                 tx = (margin + x) - min(x0, x1)
                 ty = (margin + y) - min(y0, y1)
                 tz = -max(z0, z1)
 
                 try:
-                    _move_body_translate_only(sheet_comp, nb, tx, ty, tz)
+                    _move_translate_only(sheet_comp, nb, tx, ty, tz)
                 except Exception as e:
                     try: nb.deleteMe()
                     except: pass
@@ -600,15 +678,20 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                 break
 
             if not placed_this:
-                # If we never probed (because it simply didn't fit in remaining space),
+                # If we never probed (because it simply didn't fit remaining space on this sheet),
                 # defer it to the next sheet.
                 if not probed_any:
                     next_remaining.append(it)
                 else:
-                    # We probed but couldn't get an insert method to work for any orientation
+                    # We probed but couldn't get an insert method to work for any orientation -> eliminate
                     failures_probe.append(f"{name}: probe failed (all orientations)")
-                    # eliminate so we don't deadlock
-                    # (do not append to next_remaining)
+
+        # Close BaseFeature edit for this sheet
+        try:
+            if sheet_base_feat:
+                sheet_base_feat.finishEdit()
+        except:
+            pass
 
         if placed_any:
             sheets.append(sheet_occ)
@@ -618,7 +701,6 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
 
         # Nothing placed on this sheet:
         if next_remaining and len(next_remaining) == len(remaining):
-            # Everything deferred but none placed -> we can't make progress -> stop
             ui.messageBox(
                 "Layout stopped: no bodies could be placed on this sheet.\n\n"
                 "This typically means Fusion refused insert for remaining bodies.\n"
@@ -643,13 +725,13 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             except:
                 pass
 
-    for occ in sheets:
-        try:
-            for b in occ.component.bRepBodies:
-                if b and b.isSolid:
-                    b.isVisible = True
-        except:
-            pass
+        for occ in sheets:
+            try:
+                for b in occ.component.bRepBodies:
+                    if b and b.isSolid:
+                        b.isVisible = True
+            except:
+                pass
 
     # ----------------------------
     # Summary
@@ -669,13 +751,13 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
     if skipped:
         msg.append("")
         msg.append("First skipped:")
-        msg.extend(["  - " + s for s in skipped[:10]])
+        msg.extend([" - " + s for s in skipped[:10]])
 
     if failures_probe or failures_insert or failures_move:
         msg.append("")
         msg.append("First failures:")
         for s in (failures_probe + failures_insert + failures_move)[:10]:
-            msg.append("  - " + s)
+            msg.append(" - " + s)
 
     ui.messageBox("\n".join(msg))
     return sheets
