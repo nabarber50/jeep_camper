@@ -138,49 +138,26 @@ def _stable_key(src):
     except:
         return id(src)
 
-def _collect_visible_solids(design: adsk.fusion.Design):
-    root = design.rootComponent
-    out = []
-
-    # root bodies
+def _orient_sheet_exprs_long_y(design: adsk.fusion.Design, w_expr: str, h_expr: str):
+    """
+    Returns (w_expr2, h_expr2) such that evaluated H (Y) is the long side.
+    We keep it expression-based so CAM params get the same orientation.
+    """
     try:
-        for b in root.bRepBodies:
-            if not b or not b.isSolid:
-                continue
-            if USE_VISIBLE_BODIES_ONLY and (not b.isVisible):
-                continue
-            out.append(b)
-    except:
-        pass
-
-    # occurrence bodies (may be proxies)
-    try:
-        for occ in root.allOccurrences:
-            comp = occ.component
-            if not comp:
-                continue
-            for b in comp.bRepBodies:
-                if not b or not b.isSolid:
-                    continue
-                if USE_VISIBLE_BODIES_ONLY and (not b.isVisible):
-                    continue
-                try:
-                    out.append(b.createForAssemblyContext(occ))
-                except:
-                    out.append(b)
-    except:
-        pass
-
-    # dedupe by native
-    dedup = []
-    seen = set()
-    for b in out:
-        k = _stable_key(b)
-        if k not in seen:
-            seen.add(k)
-            dedup.append(b)
-
-    return dedup
+        w_mm = _eval_mm(design, w_expr)
+        h_mm = _eval_mm(design, h_expr)
+        if w_mm > h_mm:
+            try:
+                log(f"Swapping sheet exprs for +Y long: W={w_mm:.1f} H={h_mm:.1f}")
+            except:
+                pass
+            return (h_expr, w_expr)
+    except Exception as e:
+        try:
+            log(f"Sheet orient helper failed: {e}")
+        except:
+            pass
+    return (w_expr, h_expr)
 
 def _copy_body_to_component_via_temp(design: adsk.fusion.Design,
                                      body: adsk.fusion.BRepBody,
@@ -376,6 +353,42 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         pass
     margin = _eval_mm(design, margin_expr)
     gap = _eval_mm(design, gap_expr)
+
+    # ----------------------------------------------------------------
+    # ENSURE SHEET LONG DIMENSION IS +Y
+    # If the sheet width (X) is greater than the sheet height (Y),
+    # rotate the sheet definition so +Y holds the long direction.
+    # ----------------------------------------------------------------
+    try:
+        # Evaluate provided sheet expressions
+        sheet_w_mm = _eval_mm(design, sheet_w_expr)
+        sheet_h_mm = _eval_mm(design, sheet_h_expr)
+
+        # If sheet_w is the greater dimension, we want +Y long,
+        # so swap usable definitions
+        if sheet_w_mm > sheet_h_mm:
+            log(f"Swapping sheet dims for orientation: original W={sheet_w_mm:.1f} H={sheet_h_mm:.1f}")
+            # swap expressions so Y becomes long direction
+            tmp_expr = sheet_w_expr
+            sheet_w_expr = sheet_h_expr
+            sheet_h_expr = tmp_expr
+
+            # Reevaluate to get new mm values
+            usable_swap_w = sheet_w_mm
+            usable_swap_h = sheet_h_mm
+
+            # recompute usable area with swapped dimensions
+            sheet_w_mm = usable_swap_h
+            sheet_h_mm = usable_swap_w
+            usable_w = sheet_w_mm - 2.0 * margin
+            usable_h = sheet_h_mm - 2.0 * margin
+            log(f" After swap: sheet W={sheet_w_mm:.1f} H={sheet_h_mm:.1f}, usable={usable_w:.1f}x{usable_h:.1f}")
+
+    except Exception as e:
+        try:
+             log(f"Orientation fix skipped: {str(e)}")
+        except: pass
+
 
     # ----------------------------
     # Collector with diagnostics
@@ -1690,12 +1703,15 @@ def run(context):
         sheets = []
         if DO_AUTO_LAYOUT:
             log("Starting auto layout...")
+            # Force Maslow/Fusion convention: +Y is long sheet direction
+            sheet_w_expr_oriented, sheet_h_expr_oriented = _orient_sheet_exprs_long_y(design, SHEET_W, SHEET_H)
+
             sheets = auto_layout_visible_bodies_multi_sheet(
                 design=design,
                 ui=ui,
                 layout_base_name=LAYOUT_BASE_NAME,
-                sheet_w_expr=SHEET_W,
-                sheet_h_expr=SHEET_H,
+                sheet_w_expr=sheet_w_expr_oriented,
+                sheet_h_expr=sheet_h_expr_oriented,
                 margin_expr=LAYOUT_MARGIN,
                 gap_expr=LAYOUT_GAP,
                 allow_rotate_90=ALLOW_ROTATE_90,
