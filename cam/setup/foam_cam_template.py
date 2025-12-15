@@ -27,6 +27,19 @@ SHEET_CLASSES = [
     ("WIDE_6x10", 1828.8, 3048.0),
 ]
 
+# ---- Optional concave/U-shape pairing (experimental) ----
+ENABLE_U_PAIRING = True       # set True to try interlocking U-shaped parts
+U_FILL_RATIO_MAX = 0.70        # <= this considered "concave-ish" (lower => more concave)
+U_MIN_AREA_MM2   = 250000.0    # ignore tiny parts (mm^2); reduces runtime
+U_PAIR_STEP_MM   = 25.0        # grid step for dx/dy when searching pair offsets
+U_PAIR_GRID_N    = 5           # odd number; 5 => offsets [-2..+2] steps
+U_PAIR_MIN_GAIN  = 0.10        # require >=10% bbox area improvement to accept pair
+
+# ---- Naming ergonomics ----
+COMPACT_PART_NAMES = True      # Layer_15_part_01 -> L15_P01
+LOG_NATIVE_BBOX_SIZES = False  # log native bbox sizes (can be noisy)
+
+
 SHEET_W   = '2438.4 mm'     # 8 ft (X)
 SHEET_H   = '1219.2 mm'     # 4 ft (Y)
 SHEET_THK = '38.1 mm'       # foam thickness
@@ -308,30 +321,41 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                                           allow_rotate_90: bool,
                                           hide_originals: bool):
     """
-    Multi-sheet-class nesting:
-      - Defines multiple sheet classes (STD_4x8, EXT_4x10, EXT_4x12, WIDE_6x10).
-      - Each body is assigned to the smallest class that can fit (considering optional 90° rotation).
-      - Runs the same stable packer per class, producing multiple sheets per class as needed.
+    Multi-sheet-class nesting with stable Fusion insert/move semantics.
 
-    Preserves previously agreed stability rules:
-      - Collector diagnostics + includes hidden bodies with 'Layer_' in name even if USE_VISIBLE_BODIES_ONLY=True
-      - TEMP flatten footprint with sanity-check vs bbox; fallback to bbox if TEMP footprint implausible
-      - Prefer TEMP insert for FINAL (rotation + flatten-to-Z0 cookie-cutter); copyToComponent fallback for rot=False
+    Uses global SHEET_CLASSES (CONFIG section). Order matters: earlier classes are preferred.
+    Adds:
+      - Collector diagnostics (and includes hidden 'Layer_' bodies even if USE_VISIBLE_BODIES_ONLY=True)
+      - Proxy-aware dedupe (occurrence proxies treated as unique)
+      - Sanitized footprints (TEMP flatten footprint sanity-checked vs bbox)
+      - Prefer TEMP insert for FINAL; copyToComponent only as last-resort for rot=False
       - One BaseFeature per sheet for TEMP inserts
-      - Translation-only moves
-      - Skip oversize bodies (relative to all classes)
-      - Do not mark probe failed unless probe was attempted (defer to next sheet if just no remaining space)
-      - Rename inserted bodies to match source name
-      - Periodic adsk.doEvents()
+      - Translation-only moves + drop to Z=0 (cookie-cutter)
+      - Defer to next sheet if it simply doesn't fit remaining space on current sheet
+      - Optional U-pairing prepass (ENABLE_U_PAIRING) to interlock concave-ish parts
+      - Cleaner names: sheets named SHEET_##_<CLASS>, inserted bodies named from source (optionally compacted)
     """
     root = design.rootComponent
+
+    # ----------------------------
+    # Local knobs (fallbacks if not defined in CONFIG)
+    # ----------------------------
+    enable_u_pairing = globals().get("ENABLE_U_PAIRING", False)
+    u_fill_ratio_max = float(globals().get("U_FILL_RATIO_MAX", 0.70))
+    u_min_area_mm2   = float(globals().get("U_MIN_AREA_MM2", 250000.0))
+    u_pair_step_mm   = float(globals().get("U_PAIR_STEP_MM", 25.0))
+    u_pair_grid_n    = int(globals().get("U_PAIR_GRID_N", 5))
+    u_pair_min_gain  = float(globals().get("U_PAIR_MIN_GAIN", 0.10))
+    compact_part_names = bool(globals().get("COMPACT_PART_NAMES", True))
+
     # ----------------------------
     # Safe translation-only move (self-contained)
     # ----------------------------
     def _move_translate_only(comp: adsk.fusion.Component,
                              body: adsk.fusion.BRepBody,
                              tx_mm: float, ty_mm: float, tz_mm: float):
-        dx = tx_mm * 0.1  # mm -> cm
+        # Fusion internal distance is cm; mm -> cm = *0.1
+        dx = tx_mm * 0.1
         dy = ty_mm * 0.1
         dz = tz_mm * 0.1
         mv_feats = comp.features.moveFeatures
@@ -343,13 +367,13 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         mv_feats.add(inp)
 
     # ----------------------------
-    # Evaluate parameters in mm (margin/gap are shared across classes)
+    # Margin/gap in mm (sheet sizes come from SHEET_CLASSES)
     # ----------------------------
-    # NOTE: sheet_w_expr/sheet_h_expr remain accepted but are not used for sizing now,
-    # since we are using explicit sheet classes above. We still eval them to keep behavior
-    # consistent if other parts of the script expect eval side effects/logs.
-    _ = _eval_mm(design, sheet_w_expr)
-    _ = _eval_mm(design, sheet_h_expr)
+    try:
+        _ = _eval_mm(design, sheet_w_expr)
+        _ = _eval_mm(design, sheet_h_expr)
+    except:
+        pass
     margin = _eval_mm(design, margin_expr)
     gap = _eval_mm(design, gap_expr)
 
@@ -498,27 +522,12 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
     if not bodies:
         ui.messageBox(
             "No eligible BRep solid bodies found to layout.\n\n"
-            "Check the log for 'Collector diagnostics' to see why bodies were excluded."
+            "Check Desktop log for 'Collector diagnostics'."
         )
         return []
 
-    try:
-        if diag_stats["included"] < 5:
-            preview = "\n".join([f"- {nm} | {reason} | {where}" for (nm, reason, where) in diag_excluded[:10]])
-            ui.messageBox(
-                "Body collection diagnostics (included < 5):\n\n"
-                f"seen_total={diag_stats['seen_total']} (root={diag_stats['seen_root']}, occ={diag_stats['seen_occ']})\n"
-                f"included={diag_stats['included']}  deduped_out={diag_stats['deduped_out']}\n"
-                f"excluded_not_solid={diag_stats['not_solid']}\n"
-                f"excluded_hidden={diag_stats['filtered_visibility']}\n"
-                f"excluded_non_brep_or_null={diag_stats['non_brep_or_null']}\n\n"
-                "First excluded:\n" + (preview if preview else "(none)")
-            )
-    except:
-        pass
-
     # ----------------------------
-    # Footprint helpers
+    # Footprint helpers (sanitized footprint)
     # ----------------------------
     def _bbox_footprint_mm(src_body, rot_90: bool):
         try:
@@ -563,24 +572,29 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         return tmp
 
     # ----------------------------
-    # Sheet-class chooser
+    # Sheet-class chooser (uses global SHEET_CLASSES)
     # ----------------------------
     def _usable_for_class(sw_mm: float, sh_mm: float):
         return (sw_mm - 2.0 * margin, sh_mm - 2.0 * margin)
 
     def _best_class_for_dims(w_mm: float, h_mm: float):
-        # returns (class_name, sheet_w_mm, sheet_h_mm, usable_w, usable_h)
         for cname, sw, sh in SHEET_CLASSES:
             uw, uh = _usable_for_class(sw, sh)
             if w_mm <= uw and h_mm <= uh:
                 return (cname, sw, sh, uw, uh)
         return None
 
+    # Prefer 4x8 if it fits (either orientation), otherwise smallest class that fits.
     def _pick_best_sheet_and_rot(fp0, fp1):
         local_order = {cname: i for i, (cname, _sw, _sh) in enumerate(SHEET_CLASSES)}
 
-        # Try 4x8 first
-        for rot in ([False, True] if allow_rotate_90 else [False]):
+        # hard preference: STD_4x8 if it fits in any allowed orientation
+        if allow_rotate_90:
+            rots = [False, True]
+        else:
+            rots = [False]
+
+        for rot in rots:
             fp = fp1 if rot else fp0
             if not fp:
                 continue
@@ -588,9 +602,9 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             if ok and ok[0] == "STD_4x8":
                 return ok, rot
 
-        # Otherwise pick the smallest class that fits (considering both orientations)
+        # otherwise choose smallest class that fits
         candidates = []
-        for rot in ([False, True] if allow_rotate_90 else [False]):
+        for rot in rots:
             fp = fp1 if rot else fp0
             if not fp:
                 continue
@@ -601,47 +615,138 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         if not candidates:
             return None, False
 
-        candidates.sort(key=lambda t: t[0])  # smallest class first
+        candidates.sort(key=lambda t: t[0])
         _ord, ok, rot = candidates[0]
         return ok, rot
 
     # ----------------------------
-    # Build items list, assign sheet class, skip true oversize
+    # U-ish detection (volume vs bbox volume proxy)
+    # ----------------------------
+    def _fill_ratio_xy(src_body) -> float:
+        try:
+            n = _resolve_native(src_body)
+            x0,y0,z0,x1,y1,z1 = _bbox_mm(n)
+            bw = max(abs(x1-x0), 1e-6)
+            bh = max(abs(y1-y0), 1e-6)
+            bz = max(abs(z1-z0), 1e-6)
+
+            props = n.physicalProperties
+            vol_cm3 = props.volume  # cm^3
+            vol_mm3 = vol_cm3 * 1000.0
+
+            bbox_mm3 = bw * bh * bz
+            r = vol_mm3 / bbox_mm3
+            if r < 0: r = 0.0
+            if r > 1.5: r = 1.5
+            return r
+        except:
+            return 1.0
+
+    def _no_interference(design_: adsk.fusion.Design, a: adsk.fusion.BRepBody, b: adsk.fusion.BRepBody) -> bool:
+        try:
+            oc = adsk.core.ObjectCollection.create()
+            oc.add(a); oc.add(b)
+            res = design_.analyzeInterference(oc)
+            return (res.count == 0)
+        except:
+            return False
+
+    def _rot180_insert_temp(design_, body_, target_occ_, base_feat_):
+        """TEMP copy + rotate 180° about Z + flatten to Z=0; insert into target occ."""
+        try:
+            target_comp = target_occ_.component
+            src = _resolve_native(body_)
+            temp_mgr = adsk.fusion.TemporaryBRepManager.get()
+            tmp = temp_mgr.copy(src)
+            if not tmp:
+                return None
+
+            # pivot about bbox min corner (cm)
+            bb = tmp.boundingBox
+            pivot = adsk.core.Point3D.create(bb.minPoint.x, bb.minPoint.y, 0.0)
+
+            R = adsk.core.Matrix3D.create()
+            R.setToRotation(math.radians(180.0), adsk.core.Vector3D.create(0,0,1), pivot)
+            if not temp_mgr.transform(tmp, R):
+                return None
+
+            # flatten to Z=0
+            bb2 = tmp.boundingBox
+            minz = bb2.minPoint.z
+            if abs(minz) > 1e-9:
+                Tz = adsk.core.Matrix3D.create()
+                Tz.translation = adsk.core.Vector3D.create(0.0, 0.0, -minz)
+                if not temp_mgr.transform(tmp, Tz):
+                    return None
+
+            # insert
+            if base_feat_:
+                try:
+                    return target_comp.bRepBodies.add(tmp, base_feat_)
+                except:
+                    pass
+
+            try:
+                bf = target_comp.features.baseFeatures.add()
+                bf.startEdit()
+                nb = target_comp.bRepBodies.add(tmp, bf)
+                bf.finishEdit()
+                return nb
+            except:
+                try:
+                    if 'bf' in locals() and bf:
+                        bf.finishEdit()
+                except:
+                    pass
+            try:
+                return target_comp.bRepBodies.add(tmp)
+            except:
+                return None
+        except:
+            return None
+
+    def _clean_part_name(nm: str) -> str:
+        if not compact_part_names:
+            return nm
+        try:
+            s = nm.replace("Layer_", "L").replace("layer_", "L")
+            s = s.replace("_part_", "_P").replace("_Part_", "_P").replace("_PART_", "_P")
+            return s
+        except:
+            return nm
+
+    # ----------------------------
+    # Build items (compute footprints, choose sheet class, gather fill ratio)
     # ----------------------------
     skipped = []
     items = []
+
     for b in bodies:
         name = getattr(b, "name", "(unnamed)")
         fp0 = _sanitized_footprint_mm(b, False)
         fp1 = _sanitized_footprint_mm(b, True) if allow_rotate_90 else None
 
+        # optional size sanity log (if enabled in CONFIG)
+        if globals().get("LOG_NATIVE_BBOX_SIZES", False):
+            try:
+                n = _resolve_native(b)
+                x0,y0,z0,x1,y1,z1 = _bbox_mm(n)
+                log(f"SIZE CHECK native bbox: {name} -> W={abs(x1-x0):.1f}mm H={abs(y1-y0):.1f}mm Z={abs(z1-z0):.1f}mm")
+            except:
+                pass
+
         if not fp0:
             skipped.append(f"{name} (missing footprint)")
             continue
 
-        try:
-            # Real bbox of the native body (no temp flatten)
-            n = _resolve_native(b)
-            x0,y0,z0,x1,y1,z1 = _bbox_mm(n)
-            bw = abs(x1-x0)
-            bh = abs(y1-y0)
-            bz = abs(z1-z0)
-            log(f"SIZE CHECK native bbox: {name} -> W={bw:.1f}mm H={bh:.1f}mm Z={bz:.1f}mm")
-        except:
-            pass
-
         best, best_rot = _pick_best_sheet_and_rot(fp0, fp1)
-
         if not best:
             skipped.append(f"{name} ({fp0[0]:.1f} x {fp0[1]:.1f} mm) too large for all sheet classes")
             continue
 
-        if not best:
-            # too big for ALL classes
-            skipped.append(f"{name} ({fp0[0]:.1f} x {fp0[1]:.1f} mm) too large for all sheet classes")
-            continue
-
+        fr = _fill_ratio_xy(b)
         items.append({
+            "is_pair": False,
             "body": b,
             "name": name,
             "fp0": fp0,
@@ -651,7 +756,8 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             "sheet_h": best[2],
             "usable_w": best[3],
             "usable_h": best[4],
-            "prefer_rot": best_rot
+            "prefer_rot": bool(best_rot),
+            "fill_ratio": fr,
         })
 
     if not items:
@@ -664,38 +770,16 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
     # ----------------------------
     # Group by sheet class
     # ----------------------------
-    try:
-        from collections import defaultdict
-        groups = defaultdict(list)
-        for it in items:
-            groups[it["sheet_class"]].append(it)
-    except:
-        groups = {}
-        for it in items:
-            groups.setdefault(it["sheet_class"], []).append(it)
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for it in items:
+        groups[it["sheet_class"]].append(it)
 
-    # Sort groups by sheet class order (smallest first)
     class_order = {cname: i for i, (cname, _sw, _sh) in enumerate(SHEET_CLASSES)}
     class_names_sorted = sorted(groups.keys(), key=lambda k: class_order.get(k, 999))
 
-    # Within each class, sort largest-first (stable shelf packing)
-    for cn in class_names_sorted:
-        groups[cn].sort(key=lambda it: max(it["fp0"][0], it["fp0"][1]), reverse=True)
-
-    originals_for_hiding = [it["body"] for it in items]
-
-    try:
-        log(f"Auto layout: total items={len(items)} skipped={len(skipped)}")
-        for cn in class_names_sorted:
-            log(f"  class {cn}: {len(groups[cn])} items")
-    except:
-        pass
-
     # ----------------------------
-    # Probe cache: (key, rot) -> "temp" / "copy" / ""
-    # NOTE: because proxies can be unique, cache key uses:
-    #   - proxies: id(body)
-    #   - natives: id(native)
+    # Probe cache (proxy-aware)
     # ----------------------------
     probe_cache = {}
 
@@ -772,32 +856,203 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         if method == "temp":
             return _copy_body_to_component_via_temp(design, src_body, sheet_occ,
                                                     rotate_90=bool(rot_90), base_feat=base_feat)
-
         if method == "copy":
             try:
                 native = _resolve_native(src_body)
                 return native.copyToComponent(sheet_occ)
             except:
                 return None
-
         return None
 
     # ----------------------------
-    # Packing routine for one class
+    # U-pairing prepass (per class)
     # ----------------------------
-    def _pack_class(class_name: str, class_items: list, sheet_w_mm: float, sheet_h_mm: float):
+    def _u_pair_group(class_name: str, class_items: list):
+        if not enable_u_pairing:
+            return class_items
+
+        # Only consider larger, more concave-ish items
+        candidates = []
+        for it in class_items:
+            w, h = it["fp0"]
+            area = w * h
+            if area < u_min_area_mm2:
+                continue
+            if it.get("fill_ratio", 1.0) > u_fill_ratio_max:
+                continue
+            candidates.append(it)
+
+        if len(candidates) < 2:
+            return class_items
+
+        # Temp occurrence for collision testing
+        tmp_occ = _ensure_component_occurrence(root, "_PAIR_TMP")
+        tmp_comp = tmp_occ.component
+        tmp_bf = None
+        try:
+            tmp_bf = tmp_comp.features.baseFeatures.add()
+            tmp_bf.startEdit()
+        except:
+            tmp_bf = None
+
+        try:
+            used = set()
+            new_items = []
+            remaining = list(class_items)
+
+            # Greedy pairing: for each A in descending size, find best B
+            remaining_sorted = sorted(remaining, key=lambda it: (it["fp0"][0]*it["fp0"][1]), reverse=True)
+
+            for a in remaining_sorted:
+                if id(a) in used:
+                    continue
+                if a not in candidates:
+                    continue
+
+                aw, ah = a["fp0"]
+                best = None  # (gain, b_item, dx, dy, union_w, union_h)
+
+                # precompute: sum area
+                a_area = aw * ah
+
+                for b in remaining_sorted:
+                    if b is a:
+                        continue
+                    if id(b) in used:
+                        continue
+                    if b not in candidates:
+                        continue
+
+                    bw, bh = b["fp0"]
+                    base_sum_area = a_area + (bw * bh)
+
+                    # Insert temp A (normal) and temp B (180°)
+                    ta = _copy_body_to_component_via_temp(design, a["body"], tmp_occ, rotate_90=False, base_feat=tmp_bf)
+                    tb = _rot180_insert_temp(design, b["body"], tmp_occ, tmp_bf)
+                    if not ta or not tb:
+                        try:
+                            if ta: ta.deleteMe()
+                            if tb: tb.deleteMe()
+                        except:
+                            pass
+                        continue
+
+                    # Normalize both to origin and Z=0
+                    ax0,ay0,az0,ax1,ay1,az1 = _bbox_mm(ta)
+                    try:
+                        _move_translate_only(tmp_comp, ta, -min(ax0,ax1), -min(ay0,ay1), -max(az0,az1))
+                    except:
+                        pass
+
+                    bx0,by0,bz0,bx1,by1,bz1 = _bbox_mm(tb)
+                    try:
+                        _move_translate_only(tmp_comp, tb, -min(bx0,bx1), -min(by0,by1), -max(bz0,bz1))
+                    except:
+                        pass
+
+                    half = max(1, int(u_pair_grid_n // 2))
+                    step = float(u_pair_step_mm)
+
+                    for gx in range(-half, half+1):
+                        for gy in range(-half, half+1):
+                            dx = gx * step
+                            dy = gy * step
+
+                            # Reset tb to origin then move by dx/dy
+                            bx0,by0,bz0,bx1,by1,bz1 = _bbox_mm(tb)
+                            try:
+                                _move_translate_only(tmp_comp, tb, -min(bx0,bx1), -min(by0,by1), 0.0)
+                                _move_translate_only(tmp_comp, tb, dx, dy, 0.0)
+                            except:
+                                continue
+
+                            if not _no_interference(design, ta, tb):
+                                continue
+
+                            ax0,ay0,az0,ax1,ay1,az1 = _bbox_mm(ta)
+                            bx0,by0,bz0,bx1,by1,bz1 = _bbox_mm(tb)
+                            ux0 = min(ax0, ax1, bx0, bx1)
+                            uy0 = min(ay0, ay1, by0, by1)
+                            ux1 = max(ax0, ax1, bx0, bx1)
+                            uy1 = max(ay0, ay1, by0, by1)
+                            uw = ux1 - ux0
+                            uh = uy1 - uy0
+                            union_area = uw * uh
+
+                            gain = 1.0 - (union_area / max(base_sum_area, 1e-6))
+                            if gain <= 0:
+                                continue
+
+                            if (best is None) or (gain > best[0]):
+                                best = (gain, b, dx, dy, uw, uh)
+
+                    # cleanup temps
+                    try:
+                        ta.deleteMe()
+                        tb.deleteMe()
+                    except:
+                        pass
+
+                if best and best[0] >= u_pair_min_gain:
+                    gain, b, dx, dy, uw, uh = best
+                    used.add(id(a))
+                    used.add(id(b))
+
+                    pair_name = f"PAIR_{a['name']}__{b['name']}"
+                    try:
+                        log(f"Paired {a['name']} + {b['name']} gain={gain:.2%} union={uw:.1f}x{uh:.1f}mm class={class_name}")
+                    except:
+                        pass
+
+                    new_items.append({
+                        "is_pair": True,
+                        "name": pair_name,
+                        "sheet_class": class_name,
+                        "fp0": (uw, uh),
+                        "fp1": None,
+                        "prefer_rot": False,
+                        "children": [
+                            (a, False, False, 0.0, 0.0),
+                            (b, False, True,  dx,  dy),
+                        ]
+                    })
+
+            # Add any unpaired originals
+            for it in remaining:
+                if id(it) in used:
+                    continue
+                new_items.append(it)
+
+            return new_items
+        finally:
+            try:
+                if tmp_bf:
+                    tmp_bf.finishEdit()
+            except:
+                pass
+
+    # Apply U-pairing and sort within each class
+    for cn in class_names_sorted:
+        groups[cn] = _u_pair_group(cn, groups[cn])
+        groups[cn].sort(key=lambda it: max(it["fp0"][0], it["fp0"][1]), reverse=True)
+
+    # ----------------------------
+    # Packing routine for one class (shelf pack; stable)
+    # ----------------------------
+    def _pack_class(class_name: str, class_items: list, sheet_w_mm: float, sheet_h_mm: float, global_sheet_start_index: int):
         usable_w, usable_h = _usable_for_class(sheet_w_mm, sheet_h_mm)
         sheets_local = []
-
-        remaining = list(class_items)
-        sheet_index = 1
-
         failures_probe = []
         failures_insert = []
         failures_move = []
 
+        remaining = list(class_items)
+        sheet_index = 1
+        global_sheet_index = global_sheet_start_index
+
         while remaining:
-            sheet_name = f"SHEET_{sheet_index:02d}_{class_name}"
+            # Cleaner, predictable sheet naming
+            sheet_name = f"SHEET_{global_sheet_index:02d}_{class_name}"
             sheet_occ = _ensure_component_occurrence(root, sheet_name)
             sheet_comp = sheet_occ.component
 
@@ -809,8 +1064,10 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
             except:
                 sheet_base_feat = None
 
-            try: log(f"--- SHEET START {sheet_name} remaining={len(remaining)} usable={usable_w:.1f}x{usable_h:.1f} ---")
-            except: pass
+            try:
+                log(f"--- SHEET START {sheet_name} remaining={len(remaining)} usable={usable_w:.1f}x{usable_h:.1f} ---")
+            except:
+                pass
 
             x = 0.0
             y = 0.0
@@ -823,18 +1080,14 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                     try: adsk.doEvents()
                     except: pass
 
-                b = it["body"]
-                name = it["name"]
-                fp0 = it["fp0"]
-                fp1 = it["fp1"]
+                w0, h0 = it["fp0"]
+                fp1 = it.get("fp1", None)
 
-                # Try preferred rotation first (helps route to smallest class)
-                tries = []
+                # Determine orientation tries
                 if it.get("prefer_rot", False) and allow_rotate_90 and fp1:
-                    tries.append((True, fp1[0], fp1[1]))
-                    tries.append((False, fp0[0], fp0[1]))
+                    tries = [(True, fp1[0], fp1[1]), (False, w0, h0)]
                 else:
-                    tries.append((False, fp0[0], fp0[1]))
+                    tries = [(False, w0, h0)]
                     if allow_rotate_90 and fp1:
                         tries.append((True, fp1[0], fp1[1]))
 
@@ -845,31 +1098,96 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                     if w > usable_w or h > usable_h:
                         continue
 
+                    # new row if needed
                     if x > 0.0 and (x + w) > usable_w:
                         x = 0.0
                         y += row_h + gap
                         row_h = 0.0
 
+                    # no vertical space left on this sheet
                     if (y + h) > usable_h:
                         continue
 
-                    method = _probe_method(b, sheet_occ, rot, sheet_base_feat)
+                    # If this is a composite "pair", place both children
+                    if it.get("is_pair", False):
+                        inserted = []
+                        ok_pair = True
+
+                        # Insert children in sheet component
+                        for child_it, child_rot90, child_rot180, cdx, cdy in it["children"]:
+                            src_body = child_it["body"]
+                            if child_rot180:
+                                nb = _rot180_insert_temp(design, src_body, sheet_occ, sheet_base_feat)
+                            else:
+                                nb = _copy_body_to_component_via_temp(design, src_body, sheet_occ,
+                                                                      rotate_90=bool(child_rot90), base_feat=sheet_base_feat)
+                            if not nb:
+                                ok_pair = False
+                                break
+
+                            try:
+                                nb.name = _clean_part_name(child_it["name"])
+                            except:
+                                pass
+
+                            inserted.append((nb, cdx, cdy))
+
+                        if not ok_pair:
+                            try:
+                                for nb, _, _ in inserted:
+                                    nb.deleteMe()
+                            except:
+                                pass
+                            failures_insert.append(f"{it['name']}: pair insert failed")
+                            probed_any = True  # we did attempt insertion
+                            continue
+
+                        # Anchor placement using first child bbox
+                        nb0, _, _ = inserted[0]
+                        x0,y0,z0,x1,y1,z1 = _bbox_mm(nb0)
+                        anchor_tx = (margin + x) - min(x0, x1)
+                        anchor_ty = (margin + y) - min(y0, y1)
+                        anchor_tz = -max(z0, z1)
+
+                        try:
+                            for nb, cdx, cdy in inserted:
+                                _move_translate_only(sheet_comp, nb, anchor_tx + cdx, anchor_ty + cdy, anchor_tz)
+                        except Exception as e:
+                            try:
+                                for nb, _, _ in inserted:
+                                    nb.deleteMe()
+                            except:
+                                pass
+                            failures_move.append(f"{it['name']}: pair move failed ({str(e)})")
+                            probed_any = True
+                            continue
+
+                        # Success
+                        x += w + gap
+                        row_h = max(row_h, h)
+                        placed_any = True
+                        placed_this = True
+                        break
+
+                    # Otherwise: single body placement with probe + final insert
+                    src_body = it["body"]
+                    method = _probe_method(src_body, sheet_occ, rot, sheet_base_feat)
                     probed_any = True
                     if not method:
                         continue
 
-                    nb = _final_insert(b, sheet_occ, rot, method, sheet_base_feat)
+                    nb = _final_insert(src_body, sheet_occ, rot, method, sheet_base_feat)
                     if not nb:
-                        failures_insert.append(f"{name}: final insert failed (rot={rot}, method={method})")
+                        failures_insert.append(f"{it['name']}: final insert failed (rot={rot}, method={method})")
                         continue
 
-                    # Rename inserted body to match source
+                    # Rename inserted body (traceability)
                     try:
-                        nb.name = name.replace("Layer_", "L").replace("_part_", "_P")
+                        nb.name = _clean_part_name(it["name"])
                     except:
                         pass
 
-                    # Translate-only placement + drop to Z=0
+                    # Translate-only placement to margin+(x,y), drop to Z=0
                     x0, y0, z0, x1, y1, z1 = _bbox_mm(nb)
                     tx = (margin + x) - min(x0, x1)
                     ty = (margin + y) - min(y0, y1)
@@ -880,7 +1198,7 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                     except Exception as e:
                         try: nb.deleteMe()
                         except: pass
-                        failures_move.append(f"{name}: move failed ({str(e)})")
+                        failures_move.append(f"{it['name']}: move failed ({str(e)})")
                         continue
 
                     x += w + gap
@@ -890,12 +1208,13 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                     break
 
                 if not placed_this:
+                    # If we never probed/inserted because it simply didn't fit remaining space, defer to next sheet
                     if not probed_any:
                         next_remaining.append(it)
                     else:
-                        failures_probe.append(f"{name}: probe failed (all orientations)")
+                        failures_probe.append(f"{it['name']}: probe/insert failed (all orientations)")
 
-            # Close BaseFeature edit for this sheet
+            # Finish BaseFeature edit
             try:
                 if sheet_base_feat:
                     sheet_base_feat.finishEdit()
@@ -906,37 +1225,31 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
                 sheets_local.append(sheet_occ)
                 remaining = next_remaining
                 sheet_index += 1
+                global_sheet_index += 1
                 continue
 
-            # nothing placed -> stop this class
-            if next_remaining and len(next_remaining) == len(remaining):
-                ui.messageBox(
-                    f"Layout stopped for {class_name}: no bodies could be placed on this sheet.\n\n"
-                    "This typically means Fusion refused insert for remaining bodies.\n"
-                    "Check Desktop log for PROBE/FINAL failures."
-                )
-            else:
-                ui.messageBox(
-                    f"Layout stopped for {class_name}: no bodies could be placed on this sheet.\n\n"
-                    "All remaining bodies were eliminated as unplaceable in this Fusion build.\n\n"
-                    "Check Desktop log for PROBE/FINAL failures."
-                )
+            # nothing placed -> stop
+            ui.messageBox(
+                f"Layout stopped for {class_name}: no bodies could be placed on this sheet.\n\n"
+                "Check Desktop log for failures."
+            )
             break
 
-        return sheets_local, failures_probe, failures_insert, failures_move, usable_w, usable_h
+        return sheets_local, failures_probe, failures_insert, failures_move, usable_w, usable_h, global_sheet_index
 
     # ----------------------------
-    # Run per class
+    # Run per class (in preferred order), keep a global sheet counter
     # ----------------------------
     all_sheets = []
     all_fail_probe = []
     all_fail_insert = []
     all_fail_move = []
 
+    global_sheet_index = 1
+
     for cn in class_names_sorted:
-        # Get class dims
-        sw = None
-        sh = None
+        # Find dims
+        sw = sh = None
         for cname, cw, ch in SHEET_CLASSES:
             if cname == cn:
                 sw, sh = cw, ch
@@ -944,7 +1257,9 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
         if sw is None or sh is None:
             continue
 
-        class_sheets, f_probe, f_ins, f_move, uw, uh = _pack_class(cn, groups[cn], sw, sh)
+        class_sheets, f_probe, f_ins, f_move, uw, uh, global_sheet_index = _pack_class(
+            cn, groups[cn], sw, sh, global_sheet_index
+        )
         all_sheets.extend(class_sheets)
         all_fail_probe.extend([f"[{cn}] {s}" for s in f_probe])
         all_fail_insert.extend([f"[{cn}] {s}" for s in f_ins])
@@ -959,7 +1274,10 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
     # Visibility handling
     # ----------------------------
     if hide_originals and all_sheets:
-        for b in originals_for_hiding:
+        for it in items:
+            b = it.get("body", None)
+            if not b:
+                continue
             try:
                 bb = b.nativeObject if hasattr(b, "nativeObject") and b.nativeObject else b
                 bb.isVisible = False
@@ -1006,10 +1324,6 @@ def auto_layout_visible_bodies_multi_sheet(design: adsk.fusion.Design,
     except:
         pass
     return all_sheets
-
-# ============================================================
-# CAM: STOCK/WCS + OPS
-# ============================================================
 
 def configure_stock_and_wcs_for_your_build(setup: adsk.cam.Setup,
                                           sheet_w_expr: str,
