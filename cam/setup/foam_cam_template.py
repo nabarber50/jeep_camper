@@ -189,17 +189,15 @@ def _pick_smallest_sheet_class_for_model(model_w_mm, model_h_mm, margin_mm):
     return best
 
 def _set_setup_fixed_box_stock_mm(design, setup, stock_x_mm, stock_y_mm, stock_z_mm):
-    """
-    Sets setup to fixed box stock with given mm dims.
-    Tries common parameter names across Fusion builds.
-    """
-    def _set_param_mm(name_candidates, value_mm):
+    """Sets setup to fixed box stock with given mm dims (robust across Fusion builds)."""
+
+    def _set_param_num(name_candidates, value_mm):
         for nm in name_candidates:
             try:
                 p = setup.parameters.itemByName(nm)
                 if p:
                     try:
-                        p.expression = f"{value_mm} mm"
+                        p.expression = f"{float(value_mm)} mm"
                         return True
                     except:
                         try:
@@ -210,6 +208,62 @@ def _set_setup_fixed_box_stock_mm(design, setup, stock_x_mm, stock_y_mm, stock_z
             except:
                 pass
         return False
+
+    # 1) Set stock mode via API if available (best)
+    try:
+        setup.stockMode = adsk.cam.SetupStockModes.FixedBoxStock
+    except:
+        pass
+
+    # 2) Set dimensions
+    okx = _set_param_num(
+        ["job_stockFixedBoxWidth", "stockFixedBoxWidth", "job_stockWidth", "stockWidth",
+         "job_stockFixedX", "stockFixedX"],
+        stock_x_mm
+    )
+
+    # IMPORTANT: do NOT include any *Height* params here
+    oky = _set_param_num(
+        ["job_stockFixedBoxLength", "stockFixedBoxLength", "job_stockLength", "stockLength",
+         "job_stockFixedY", "stockFixedY"],
+        stock_y_mm
+    )
+
+    okz = _set_param_num(
+        ["job_stockFixedBoxHeight", "stockFixedBoxHeight", "job_stockThickness", "stockThickness",
+         "job_stockFixedZ", "stockFixedZ"],
+        stock_z_mm
+    )
+
+    # 3) Optional center modes if supported
+    try:
+        for nm in ["job_stockFixedXMode", "job_stockFixedYMode", "job_stockFixedZMode"]:
+            try:
+                p = setup.parameters.itemByName(nm)
+                if p:
+                    try:
+                        p.expression = "center"
+                    except:
+                        try:
+                            p.value = "center"
+                        except:
+                            pass
+            except:
+                pass
+    except:
+        pass
+
+    try:
+        log(f"Stock set (mm): X={stock_x_mm:.1f} Y={stock_y_mm:.1f} Z={stock_z_mm:.1f} ok=({okx},{oky},{okz})")
+    except:
+        pass
+
+    # If Y didn't set, dump params so we can add the right name for your Fusion build
+    if not oky or not okx or not okz:
+        try:
+            _dump_setup_params(setup, contains=("stock", "fixed", "box", "mode", "width", "length", "height"))
+        except:
+            pass
 
     def _set_param_raw(name_candidates, raw_expr):
         for nm in name_candidates:
