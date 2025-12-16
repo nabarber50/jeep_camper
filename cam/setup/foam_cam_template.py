@@ -1716,9 +1716,19 @@ def configure_stock_and_wcs_for_your_build(setup: adsk.cam.Setup,
     _try_enum('job_stockOffsetMode', ['simple', 'advanced'])
     _try_enum('job_stockMode', ['fixedbox', 'fixedBox', 'fixed', 'default'])
 
-    _set_expr('job_stockFixedX', sheet_w_expr)
-    _set_expr('job_stockFixedY', sheet_h_expr)
-    _set_expr('job_stockFixedZ', sheet_thk_expr)
+    # Fixed-size stock param names vary a lot by Fusion build.
+    def _set_expr_any(names, expr):
+        for n in names:
+            if _set_expr(n, expr):
+                log(f"Stock param set: {n} = {expr}")
+                return True
+        log(f"Stock param NOT found for expr={expr}. Tried: {names}")
+        return False
+
+    # X = Width, Y = Depth/Length, Z = Height
+    _set_expr_any(['job_stockFixedBoxWidth','stockFixedBoxWidth','job_stockFixedX','job_stockFixedXValue','job_stockFixedXExpr'], sheet_w_expr)
+    _set_expr_any(['job_stockFixedBoxDepth','job_stockFixedBoxLength','stockFixedBoxDepth','stockFixedBoxLength','job_stockFixedY','job_stockFixedYValue','job_stockFixedYExpr'], sheet_h_expr)
+    _set_expr_any(['job_stockFixedBoxHeight','stockFixedBoxHeight','job_stockFixedZ','job_stockFixedZValue','job_stockFixedZExpr'], sheet_thk_expr)
 
     _try_enum('job_stockFixedXMode', ['center', 'model'])
     _try_enum('job_stockFixedYMode', ['center', 'model'])
@@ -2189,7 +2199,7 @@ def run(context):
             cam, design, ui, sheets,
             enforce_orientation_cb=_enforce_setup_orientation
         )
-        
+
         log("CAM creation complete.")
 
         ui.messageBox(f"Done.\n\nSheets: {len(sheets)}\nCAM Setups created: {len(sheets)}")
