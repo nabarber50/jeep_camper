@@ -193,19 +193,17 @@ def _set_setup_fixed_box_stock_mm(design, setup, stock_x_mm, stock_y_mm, stock_z
     Sets setup to fixed box stock with given mm dims.
     Tries common parameter names across Fusion builds.
     """
-    # Preferred: parameters (stable across many scripts)
-    def _set_param(name_candidates, value_mm):
+    def _set_param_mm(name_candidates, value_mm):
         for nm in name_candidates:
             try:
                 p = setup.parameters.itemByName(nm)
                 if p:
-                    # Fusion CAM params are strings/ValueInputs depending on build; .expression is safest
                     try:
                         p.expression = f"{value_mm} mm"
                         return True
                     except:
                         try:
-                            p.value = value_mm
+                            p.value = float(value_mm)
                             return True
                         except:
                             pass
@@ -213,31 +211,53 @@ def _set_setup_fixed_box_stock_mm(design, setup, stock_x_mm, stock_y_mm, stock_z
                 pass
         return False
 
+    def _set_param_raw(name_candidates, raw_expr):
+        for nm in name_candidates:
+            try:
+                p = setup.parameters.itemByName(nm)
+                if p:
+                    try:
+                        p.expression = str(raw_expr)
+                        return True
+                    except:
+                        try:
+                            p.value = raw_expr
+                            return True
+                        except:
+                            pass
+            except:
+                pass
+        return False
+
+
     # Stock mode (best-effort)
     try:
         setup.stockMode = adsk.cam.SetupStockModes.FixedBoxStock
     except:
         pass
 
-    ok_mode = _set_param(["job_stockMode", "stockMode"], "fixedBox")  # best-effort string mode
+    ok_mode = _set_param_raw(["job_stockMode", "stockMode"], "fixedBox")
 
-    okx = _set_param(
-    ["job_stockFixedBoxWidth","stockFixedBoxWidth","job_stockWidth","stockWidth",
-    "job_stockFixedX","stockFixedX"],
-    stock_x_mm
-    )
-    oky = _set_param(
-    ["job_stockFixedBoxLength","stockFixedBoxLength","job_stockLength","stockLength",
-    "job_stockFixedY","stockFixedY",
-    "job_stockFixedBoxHeight","stockFixedBoxHeight"],
-    stock_y_mm
-    )
-    okz = _set_param(
-    ["job_stockFixedBoxHeight","stockFixedBoxHeight","job_stockThickness","stockThickness",
-    "job_stockFixedZ","stockFixedZ"],
-    stock_z_mm
+    okx = _set_param_mm(
+        ["job_stockFixedBoxWidth","stockFixedBoxWidth","job_stockWidth","stockWidth",
+        "job_stockFixedX","stockFixedX"],
+        stock_x_mm
     )
 
+    oky = _set_param_mm(
+        ["job_stockFixedBoxLength","stockFixedBoxLength",
+        "job_stockFixedBoxDepth","stockFixedBoxDepth",   # add these
+        "job_stockLength","stockLength",
+        "job_stockFixedY","stockFixedY"],
+        stock_y_mm
+    )
+
+    okz = _set_param_mm(
+        ["job_stockFixedBoxHeight","stockFixedBoxHeight",
+        "job_stockThickness","stockThickness",
+        "job_stockFixedZ","stockFixedZ"],
+        stock_z_mm
+    )
     # Optional: force center modes if your build supports them
     try:
         for nm in ["job_stockFixedXMode", "job_stockFixedYMode", "job_stockFixedZMode"]:
@@ -256,30 +276,56 @@ def _set_setup_fixed_box_stock_mm(design, setup, stock_x_mm, stock_y_mm, stock_z
 
 def _set_wcs_top_center_after_verified(setup):
     """
-    Sets WCS origin to TOP CENTER of stock box (best-effort across builds).
-    This MUST be called only after stock dims are correct.
+    Your Fusion build uses:
+      - wcs_origin_mode = 'stockPoint'
+      - wcs_origin_boxPoint = 'top center'
+    And we force stock-point selection to avoid Fusion switching back to model origin.
     """
-    # Common parameter name in many scripts: wcs_origin_boxPoint / job_wcsOriginBoxPoint
-    candidates = ["wcs_origin_boxPoint", "job_wcsOriginBoxPoint", "wcsOriginBoxPoint", "job_wcsOrigin"]
-    for nm in candidates:
+    try:
+        params = setup.parameters
+
+        # 1) Make sure we're using stock point origin mode
         try:
-            p = setup.parameters.itemByName(nm)
-            if not p:
-                continue
-            # enum values vary; “topCenter” is common in scripts, some use integer codes
-            try:
-                p.expression = "topCenter"
-                log("WCS origin set via expression: topCenter")
-                return True
-            except:
-                pass
+            p = params.itemByName("wcs_origin_mode")
+            if p:
+                p.expression = "stockPoint"
         except:
             pass
-    try:
-        log("WCS origin: could not set (param name differs on this Fusion build).")
-    except:
-        pass
-    return False
+
+        # 2) Set origin to TOP CENTER (exact token for your build)
+        try:
+            p = params.itemByName("wcs_origin_boxPoint")
+            if p:
+                p.expression = "'top center'"  # quotes matter in many builds
+        except:
+            try:
+                log("WCS origin: could not set wcs_origin_boxPoint.")
+            except:
+                pass
+            return False
+
+        # 3) ✅ THIS IS THE SNIPPET YOU ASKED ABOUT (put it RIGHT HERE)
+        # Prefer stock point, not model point
+        for nm, expr in [("wcs_stock_point", "true"), ("wcs_model_point", "false")]:
+            try:
+                p = params.itemByName(nm)
+                if p:
+                    p.expression = expr
+            except:
+                pass
+
+        try:
+            log("WCS origin set: stockPoint / top center (stock point forced).")
+        except:
+            pass
+        return True
+
+    except Exception as e:
+        try:
+            log(f"WCS origin: exception setting top center: {e}")
+        except:
+            pass
+        return False
 
 def _ensure_setup_orientation_stock_wcs(design, ui, setup, model_bodies):
     """
@@ -353,9 +399,9 @@ def _ensure_setup_orientation_stock_wcs(design, ui, setup, model_bodies):
         )
 
     # 7) Now set origin top-center (only after verification)
-    _set_wcs_top_center_after_verified(setup)
-
-    if not _set_wcs_top_center_after_verified(setup):
+    ok = _set_wcs_top_center_after_verified(setup)
+    if not ok:
+        log("WCS origin still not set; see parameter dump above.")
         _dump_setup_params(setup)
 
     try:
@@ -1959,34 +2005,34 @@ def create_cam_for_sheets(cam, design, ui, sheets, enforce_orientation_cb=None):
         except:
             pass
 
-        # --- NEW: enforce Maslow/Fusion orientation + stock>=model + origin-after-verify ---
-        enforced_ok = False
-        if enforce_orientation_cb:
-            try:
-                enforced_ok = bool(enforce_orientation_cb(setup, model_bodies_for_this_setup))
-            except:
-                enforced_ok = False
+        # # --- NEW: enforce Maslow/Fusion orientation + stock>=model + origin-after-verify ---
+        # enforced_ok = False
+        # if enforce_orientation_cb:
+        #     try:
+        #         enforced_ok = bool(enforce_orientation_cb(setup, model_bodies_for_this_setup))
+        #     except:
+        #         enforced_ok = False
 
-        if not enforced_ok:
-            enforcement_failures += 1
-            # Fallback: your existing build-specific param setter
-            try:
+        # if not enforced_ok:
+        #     enforcement_failures += 1
+        #     # Fallback: your existing build-specific param setter
+        #     try:
 
-                sheet_w_expr_oriented, sheet_h_expr_oriented = _orient_sheet_exprs_long_y(design, SHEET_W, SHEET_H)
-                configure_stock_and_wcs_for_your_build(
-                    setup,
-                    sheet_w_expr=sheet_w_expr_oriented,
-                    sheet_h_expr=sheet_h_expr_oriented,
-                    sheet_thk_expr=SHEET_THK,
-                    side_off_expr='0 mm',
-                    top_off_expr='0 mm',
-                    bot_off_expr='0 mm'
-                )
-                log(f"{setup.name}: used fallback configure_stock_and_wcs_for_your_build()")
-            except:
-                log(f"{setup.name}: WARNING stock/WCS fallback also failed.")
-        else:
-            log(f"{setup.name}: orientation enforcement applied.")
+        #         sheet_w_expr_oriented, sheet_h_expr_oriented = _orient_sheet_exprs_long_y(design, SHEET_W, SHEET_H)
+        #         configure_stock_and_wcs_for_your_build(
+        #             setup,
+        #             sheet_w_expr=sheet_w_expr_oriented,
+        #             sheet_h_expr=sheet_h_expr_oriented,
+        #             sheet_thk_expr=SHEET_THK,
+        #             side_off_expr='0 mm',
+        #             top_off_expr='0 mm',
+        #             bot_off_expr='0 mm'
+        #         )
+        #         log(f"{setup.name}: used fallback configure_stock_and_wcs_for_your_build()")
+        #     except:
+        #         log(f"{setup.name}: WARNING stock/WCS fallback also failed.")
+        # else:
+        #     log(f"{setup.name}: orientation enforcement applied.")
 
         ops = setup.operations
 
@@ -2143,6 +2189,7 @@ def run(context):
             cam, design, ui, sheets,
             enforce_orientation_cb=_enforce_setup_orientation
         )
+        
         log("CAM creation complete.")
 
         ui.messageBox(f"Done.\n\nSheets: {len(sheets)}\nCAM Setups created: {len(sheets)}")
