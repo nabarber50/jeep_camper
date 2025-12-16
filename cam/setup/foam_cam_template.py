@@ -83,6 +83,33 @@ def log(msg: str):
     except:
         pass
 
+def _dump_setup_params(setup, contains=("wcs", "origin", "box", "point")):
+    try:
+        params = setup.parameters
+        log("---- SETUP PARAM DUMP (filtered) ----")
+        for i in range(params.count):
+            p = params.item(i)
+            name = ""
+            try:
+                name = p.name
+            except:
+                continue
+            low = name.lower()
+            if any(k in low for k in contains):
+                try:
+                    val = ""
+                    try:
+                        val = str(p.expression)
+                    except:
+                        try: val = str(p.value)
+                        except: val = "<?>"
+                    log(f"PARAM: {name} = {val}")
+                except:
+                    log(f"PARAM: {name}")
+        log("---- END SETUP PARAM DUMP ----")
+    except Exception as e:
+        log(f"_dump_setup_params failed: {e}")
+
 def _eval_mm(design: adsk.fusion.Design, expr: str) -> float:
     """
     Evaluate expression to mm float.
@@ -195,19 +222,20 @@ def _set_setup_fixed_box_stock_mm(design, setup, stock_x_mm, stock_y_mm, stock_z
     ok_mode = _set_param(["job_stockMode", "stockMode"], "fixedBox")  # best-effort string mode
 
     okx = _set_param(
-        ["job_stockFixedBoxWidth", "stockFixedBoxWidth", "job_stockWidth", "stockWidth",
-        "job_stockFixedX", "stockFixedX", "job_stockFixedX"],  # <-- add these
-        stock_x_mm
+    ["job_stockFixedBoxWidth","stockFixedBoxWidth","job_stockWidth","stockWidth",
+    "job_stockFixedX","stockFixedX"],
+    stock_x_mm
     )
     oky = _set_param(
-        ["job_stockFixedBoxLength", "stockFixedBoxLength", "job_stockLength", "stockLength",
-        "job_stockFixedY", "stockFixedY", "job_stockFixedY"],  # <-- add these
-        stock_y_mm
+    ["job_stockFixedBoxLength","stockFixedBoxLength","job_stockLength","stockLength",
+    "job_stockFixedY","stockFixedY",
+    "job_stockFixedBoxHeight","stockFixedBoxHeight"],
+    stock_y_mm
     )
     okz = _set_param(
-        ["job_stockFixedBoxHeight", "stockFixedBoxHeight", "job_stockThickness", "stockThickness",
-        "job_stockFixedZ", "stockFixedZ", "job_stockFixedZ"],  # <-- add these
-        stock_z_mm
+    ["job_stockFixedBoxHeight","stockFixedBoxHeight","job_stockThickness","stockThickness",
+    "job_stockFixedZ","stockFixedZ"],
+    stock_z_mm
     )
 
     # Optional: force center modes if your build supports them
@@ -326,6 +354,9 @@ def _ensure_setup_orientation_stock_wcs(design, ui, setup, model_bodies):
 
     # 7) Now set origin top-center (only after verification)
     _set_wcs_top_center_after_verified(setup)
+
+    if not _set_wcs_top_center_after_verified(setup):
+        _dump_setup_params(setup)
 
     try:
         log(f"Setup orientation complete: sheetClass={cname} stockX={stockX:.1f} stockY={stockY:.1f} "
