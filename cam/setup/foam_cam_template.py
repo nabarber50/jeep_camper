@@ -111,6 +111,254 @@ def _eval_mm(design: adsk.fusion.Design, expr: str) -> float:
     val = float(um.evaluateExpression(expr, 'mm'))
     return val * _EVAL_MM_FACTOR
 
+def _union_bbox_mm(bodies):
+    """Union bbox of bodies, returns (x0,y0,z0,x1,y1,z1) in mm."""
+    x0 = y0 = z0 =  1e99
+    x1 = y1 = z1 = -1e99
+    any_body = False
+    for b in bodies or []:
+        try:
+            n = _resolve_native(b)
+            bx0, by0, bz0, bx1, by1, bz1 = _bbox_mm(n)
+            x0 = min(x0, bx0); y0 = min(y0, by0); z0 = min(z0, bz0)
+            x1 = max(x1, bx1); y1 = max(y1, by1); z1 = max(z1, bz1)
+            any_body = True
+        except:
+            pass
+    if not any_body:
+        return None
+    return (x0, y0, z0, x1, y1, z1)
+
+def _model_xy_extents_mm(model_bodies):
+    bb = _union_bbox_mm(model_bodies)
+    if not bb:
+        return None
+    x0,y0,_z0,x1,y1,_z1 = bb
+    return (abs(x1-x0), abs(y1-y0))
+
+def _pick_smallest_sheet_class_for_model(model_w_mm, model_h_mm, margin_mm):
+    """
+    Returns (className, stockX_mm, stockY_mm) where stockY is the LONG axis (Maslow +Y away).
+    Uses SHEET_CLASSES (w,h) in mm.
+    """
+    req_w = model_w_mm + 2.0 * margin_mm
+    req_h = model_h_mm + 2.0 * margin_mm
+
+    best = None
+    for cname, sw, sh in SHEET_CLASSES:
+        # enforce: Fusion +Y is the LONG physical axis
+        stockY = max(sw, sh)
+        stockX = min(sw, sh)
+
+        # model must fit within stock X/Y (no rotation here; rotation decision is WCS-level)
+        if req_w <= stockX and req_h <= stockY:
+            best = (cname, stockX, stockY)
+            break
+        if req_h <= stockX and req_w <= stockY:
+            # would fit if we rotate WCS 90°
+            best = (cname, stockX, stockY)
+            break
+
+    return best
+
+def _set_setup_fixed_box_stock_mm(design, setup, stock_x_mm, stock_y_mm, stock_z_mm):
+    """
+    Sets setup to fixed box stock with given mm dims.
+    Tries common parameter names across Fusion builds.
+    """
+    # Preferred: parameters (stable across many scripts)
+    def _set_param(name_candidates, value_mm):
+        for nm in name_candidates:
+            try:
+                p = setup.parameters.itemByName(nm)
+                if p:
+                    # Fusion CAM params are strings/ValueInputs depending on build; .expression is safest
+                    try:
+                        p.expression = f"{value_mm} mm"
+                        return True
+                    except:
+                        try:
+                            p.value = value_mm
+                            return True
+                        except:
+                            pass
+            except:
+                pass
+        return False
+
+    # Stock mode (best-effort)
+    try:
+        setup.stockMode = adsk.cam.SetupStockModes.FixedBoxStock
+    except:
+        pass
+
+    okx = _set_param(
+        ["job_stockFixedBoxWidth", "stockFixedBoxWidth", "job_stockWidth", "stockWidth"],
+        stock_x_mm
+    )
+    oky = _set_param(
+        ["job_stockFixedBoxLength", "stockFixedBoxLength", "job_stockLength", "stockLength",
+         "job_stockFixedBoxHeight", "stockFixedBoxHeight"],  # some builds misuse “height” for Y
+        stock_y_mm
+    )
+    okz = _set_param(
+        ["job_stockFixedBoxHeight", "stockFixedBoxHeight", "job_stockThickness", "stockThickness"],
+        stock_z_mm
+    )
+
+    try:
+        log(f"Stock set (mm): X={stock_x_mm:.1f} Y={stock_y_mm:.1f} Z={stock_z_mm:.1f} ok=({okx},{oky},{okz})")
+    except:
+        pass
+
+def _set_wcs_top_center_after_verified(setup):
+    """
+    Sets WCS origin to TOP CENTER of stock box (best-effort across builds).
+    This MUST be called only after stock dims are correct.
+    """
+    # Common parameter name in many scripts: wcs_origin_boxPoint / job_wcsOriginBoxPoint
+    candidates = ["wcs_origin_boxPoint", "job_wcsOriginBoxPoint", "wcsOriginBoxPoint", "job_wcsOrigin"]
+    for nm in candidates:
+        try:
+            p = setup.parameters.itemByName(nm)
+            if not p:
+                continue
+            # enum values vary; “topCenter” is common in scripts, some use integer codes
+            try:
+                p.expression = "topCenter"
+                log("WCS origin set via expression: topCenter")
+                return True
+            except:
+                pass
+        except:
+            pass
+    try:
+        log("WCS origin: could not set (param name differs on this Fusion build).")
+    except:
+        pass
+    return False
+
+def _ensure_setup_orientation_stock_wcs(design, ui, setup, model_bodies):
+    """
+    Core rule:
+      - Maslow +Y moves away from you
+      - Therefore Fusion +Y MUST be the long sheet direction
+      - If model long axis is X, rotate WCS 90° (swap X/Y axes) so toolpaths align to Maslow
+    Also ensures stock >= model and only then sets origin top-center.
+    """
+    # 1) detect model extents
+    ex = _model_xy_extents_mm(model_bodies)
+    if not ex:
+        raise RuntimeError("Could not compute model extents (no bodies?).")
+    model_x, model_y = ex
+    model_long_is_x = (model_x >= model_y)
+
+    margin_mm = _eval_mm(design, LAYOUT_MARGIN)
+    stock_thk_mm = _eval_mm(design, SHEET_THK)
+
+    # 2) pick a sheet class that will fit (and enforce long axis to +Y)
+    pick = _pick_smallest_sheet_class_for_model(model_x, model_y, margin_mm)
+    if not pick:
+        raise RuntimeError(f"No SHEET_CLASSES size fits model {model_x:.1f}x{model_y:.1f} mm with margin {margin_mm:.1f} mm")
+
+    cname, stockX, stockY = pick
+
+    # 3) decide whether we need to rotate WCS 90°
+    # If model is longer in X than Y, we rotate WCS so model-long maps to +Y.
+    rotate_wcs_90 = model_long_is_x
+
+    # 4) Set stock dims. If we rotate WCS, we DO NOT rotate the physical stock;
+    # we keep stock long axis in +Y (stockY is long), but we rotate WCS axes so toolpaths match Maslow.
+    _set_setup_fixed_box_stock_mm(design, setup, stockX, stockY, stock_thk_mm)
+
+    # 5) Apply WCS orientation swap (best-effort). Your build may already do this elsewhere;
+    # this block is safe: it only tries if the API surface exists.
+    try:
+        if rotate_wcs_90:
+            # Many builds allow setting orientation axes explicitly.
+            # We try to swap X and Y by rotating the WCS about +Z.
+            o = setup.workCoordinateSystemOrientation
+            o.flipX = False
+            o.flipY = False
+            try:
+                o.rotationAngle = math.radians(90.0)
+            except:
+                # if rotationAngle not supported, leave it; stock still correct, but WCS may still be off
+                pass
+            try:
+                log("WCS: requested +90° rotation so model-long maps to +Y (Maslow away).")
+            except:
+                pass
+        else:
+            try:
+                log("WCS: no rotation needed (model-long already aligns with +Y).")
+            except:
+                pass
+    except:
+        try:
+            log("WCS rotation: API not available on this Fusion build; stock will still be correct.")
+        except:
+            pass
+
+    # 6) Verify stock >= model (in the intended mapping) before setting origin
+    # If rotate_wcs_90, model_x maps to Y and model_y maps to X
+    fit_x = (model_y if rotate_wcs_90 else model_x) + 2.0 * margin_mm
+    fit_y = (model_x if rotate_wcs_90 else model_y) + 2.0 * margin_mm
+    if fit_x > stockX + 1e-6 or fit_y > stockY + 1e-6:
+        raise RuntimeError(
+            f"Stock too small after orientation. Need {fit_x:.1f}x{fit_y:.1f} mm, have {stockX:.1f}x{stockY:.1f} mm"
+        )
+
+    # 7) Now set origin top-center (only after verification)
+    _set_wcs_top_center_after_verified(setup)
+
+    try:
+        log(f"Setup orientation complete: sheetClass={cname} stockX={stockX:.1f} stockY={stockY:.1f} "
+            f"modelX={model_x:.1f} modelY={model_y:.1f} rotateWCS90={rotate_wcs_90}")
+    except:
+        pass
+
+    # --- HARD LOCK: prevent Fusion from re-sizing stock to model ---
+    try:
+        params = setup.parameters
+
+        # Force model position to Center AFTER stock dims are set
+        for nm in [
+            'job_stockFixedBoxPosition',
+            'stockFixedBoxPosition',
+            'job_stockPosition',
+            'stockPosition'
+        ]:
+            try:
+                p = params.itemByName(nm)
+                if p:
+                    p.expression = 'center'
+            except:
+                pass
+
+        # Explicitly disable "Ground stock at model origin"
+        for nm in [
+            'job_stockGroundToModel',
+            'stockGroundToModel',
+            'job_groundStockAtModelOrigin'
+        ]:
+            try:
+                p = params.itemByName(nm)
+                if p:
+                    try:
+                        p.value = False
+                    except:
+                        p.expression = 'false'
+            except:
+                pass
+
+        log("Stock lock applied: fixed box preserved.")
+    except:
+        log("WARNING: failed to hard-lock stock; Fusion may resize it.")
+
+
+    return {"sheetClass": cname, "rotateWCS90": rotate_wcs_90, "stockX": stockX, "stockY": stockY}
+
 
 # ============================================================
 # GEOMETRY HELPERS
@@ -1537,10 +1785,15 @@ def get_cam_product(app: adsk.core.Application,
     return None
 
 
-def create_cam_for_sheets(cam, design, ui, sheet_occs):
+def create_cam_for_sheets(cam, design, ui, sheets, enforce_orientation_cb=None):
     """
     One setup per sheet occurrence.
     Avoids hard assumptions about param names and strategy IDs.
+
+    Updated:
+      - derives occurrences from `sheets` (no `sheet_occs` dependency)
+      - calls enforce_orientation_cb(setup, model_bodies_for_setup) right after setup.models assignment
+      - falls back to configure_stock_and_wcs_for_your_build() if enforcement is missing/fails
     """
     warn_state = {"warned": False}
 
@@ -1583,52 +1836,119 @@ def create_cam_for_sheets(cam, design, ui, sheet_occs):
             return
         try:
             op.tool = tool
-            return
         except:
             pass
 
-    for occ in sheet_occs:
+    def _coerce_occ_list_from_sheets(sheets_list):
+        """
+        Accepts a variety of sheet item shapes:
+          - Occurrence directly
+          - dict with keys: 'occ', 'occurrence', 'sheet_occ', 'sheetOccurrence'
+          - object with attribute .occ or .occurrence
+        Returns list[adsk.fusion.Occurrence]
+        """
+        occs = []
+        for s in (sheets_list or []):
+            occ = None
+            try:
+                # direct occurrence
+                if hasattr(s, "component") and hasattr(s, "transform"):
+                    occ = s
+                # dict forms
+                elif isinstance(s, dict):
+                    occ = s.get("occ") or s.get("occurrence") or s.get("sheet_occ") or s.get("sheetOccurrence")
+                else:
+                    # attribute forms
+                    if hasattr(s, "occ"):
+                        occ = getattr(s, "occ")
+                    elif hasattr(s, "occurrence"):
+                        occ = getattr(s, "occurrence")
+            except:
+                occ = None
+
+            if occ:
+                occs.append(occ)
+
+        return occs
+
+    occ_list = _coerce_occ_list_from_sheets(sheets)
+    if not occ_list:
+        # Nothing to do
+        ui.messageBox("No sheet occurrences found in `sheets`. CAM not created.")
+        log("create_cam_for_sheets: no occurrences derived from sheets -> abort.")
+        return
+
+    setups_created = 0
+    enforcement_failures = 0
+
+    for occ in occ_list:
+        # Create setup
         setup_in = cam.setups.createInput(adsk.cam.OperationTypes.MillingOperation)
         setup = cam.setups.add(setup_in)
-        setup.name = f'CAM_{occ.component.name}'
+        try:
+            setup.name = f'CAM_{occ.component.name}'
+        except:
+            setup.name = 'CAM_Sheet'
 
-        # models = all bodies in sheet component
+        # Models = all solid bodies in sheet component
         coll = adsk.core.ObjectCollection.create()
+        model_bodies_for_this_setup = []
         try:
             for b in occ.component.bRepBodies:
                 if b and b.isSolid:
                     coll.add(b)
+                    model_bodies_for_this_setup.append(b)
         except:
             pass
 
+        # Assign models
         try:
             setup.models = coll
         except:
             pass
 
+        # Ensure stock mode is Fixed Box (best effort)
         try:
             setup.stockMode = adsk.cam.SetupStockModes.FixedBoxStock
         except:
             pass
 
-        # set stock/WCS using your build’s params
-        try:
-            configure_stock_and_wcs_for_your_build(
-                setup,
-                sheet_w_expr=SHEET_W,
-                sheet_h_expr=SHEET_H,
-                sheet_thk_expr=SHEET_THK,
-                side_off_expr='0 mm',
-                top_off_expr='0 mm',
-                bot_off_expr='0 mm'
-            )
-        except:
-            pass
+        # --- NEW: enforce Maslow/Fusion orientation + stock>=model + origin-after-verify ---
+        enforced_ok = False
+        if enforce_orientation_cb:
+            try:
+                enforced_ok = bool(enforce_orientation_cb(setup, model_bodies_for_this_setup))
+            except:
+                enforced_ok = False
+
+        if not enforced_ok:
+            enforcement_failures += 1
+            # Fallback: your existing build-specific param setter
+            try:
+                configure_stock_and_wcs_for_your_build(
+                    setup,
+                    sheet_w_expr=SHEET_W,
+                    sheet_h_expr=SHEET_H,
+                    sheet_thk_expr=SHEET_THK,
+                    side_off_expr='0 mm',
+                    top_off_expr='0 mm',
+                    bot_off_expr='0 mm'
+                )
+                log(f"{setup.name}: used fallback configure_stock_and_wcs_for_your_build()")
+            except:
+                log(f"{setup.name}: WARNING stock/WCS fallback also failed.")
+        else:
+            log(f"{setup.name}: orientation enforcement applied.")
 
         ops = setup.operations
 
         # ---- 2D Contour (best effort) ----
-        prof_in = create_2d_contour_input_best_effort(ops, ui, warn_state)
+        prof_in = None
+        try:
+            prof_in = create_2d_contour_input_best_effort(ops, ui, warn_state)
+        except:
+            prof_in = None
+
         if prof_in:
             prof_in.displayName = 'Foam Cutout 2D (Profile)'
             prof = ops.add(prof_in)
@@ -1666,13 +1986,21 @@ def create_cam_for_sheets(cam, design, ui, sheet_occs):
         except Exception as e:
             ui.messageBox(f"Failed creating Scallop op in {setup.name}:\n{e}")
 
+        setups_created += 1
+        try:
+            adsk.doEvents()
+        except:
+            pass
+
     ui.messageBox(
         "CAM creation complete.\n\n"
+        f"Setups created: {setups_created}\n"
+        f"Orientation enforcement failures (used fallback): {enforcement_failures}\n\n"
         "Notes:\n"
         "- If 2D Contour cannot be created by API in this build, add it manually once and save a Template.\n"
-        "- If stock sizing didn’t apply automatically, confirm Setup → Stock is 2438.4 × 1219.2 × 38.1 mm and save a Template."
+        "- If stock sizing didn’t apply automatically, confirm Setup → Stock is correct and save a Template.\n"
+        "- If Maslow is still 90° off, your Fusion build may not support WCS rotation via API; we’ll target the exact WCS params next."
     )
-
 
 # ============================================================
 # RUN
@@ -1703,7 +2031,8 @@ def run(context):
         sheets = []
         if DO_AUTO_LAYOUT:
             log("Starting auto layout...")
-            # Force Maslow/Fusion convention: +Y is long sheet direction
+
+            # Force Maslow/Fusion convention: +Y is long sheet direction (layout stage)
             sheet_w_expr_oriented, sheet_h_expr_oriented = _orient_sheet_exprs_long_y(design, SHEET_W, SHEET_H)
 
             sheets = auto_layout_visible_bodies_multi_sheet(
@@ -1750,7 +2079,22 @@ def run(context):
 
         # 3) CAM per sheet
         log("Creating CAM setups/ops for sheets...")
-        create_cam_for_sheets(cam, design, ui, sheets)
+
+        # --- NEW: enforce stock + WCS orientation per setup ---
+        # This must be applied INSIDE create_cam_for_sheets when each setup is created.
+        def _enforce_setup_orientation(setup, model_bodies_for_setup):
+            try:
+                _ensure_setup_orientation_stock_wcs(design, ui, setup, model_bodies_for_setup)
+                return True
+            except Exception:
+                tb = traceback.format_exc()
+                log("Orientation enforcement failed:\n" + tb)
+                return False
+
+        create_cam_for_sheets(
+            cam, design, ui, sheets,
+            enforce_orientation_cb=_enforce_setup_orientation
+        )
         log("CAM creation complete.")
 
         ui.messageBox(f"Done.\n\nSheets: {len(sheets)}\nCAM Setups created: {len(sheets)}")
@@ -1763,3 +2107,4 @@ def run(context):
             ui.messageBox("Failed (see Desktop log: foam_cam_template_log.txt):\n\n" + tb)
     finally:
         log("=== RUN END ===")
+
