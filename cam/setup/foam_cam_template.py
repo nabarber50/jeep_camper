@@ -192,24 +192,39 @@ def _set_setup_fixed_box_stock_mm(design, setup, stock_x_mm, stock_y_mm, stock_z
     except:
         pass
 
+    ok_mode = _set_param(["job_stockMode", "stockMode"], "fixedBox")  # best-effort string mode
+
     okx = _set_param(
-        ["job_stockFixedBoxWidth", "stockFixedBoxWidth", "job_stockWidth", "stockWidth"],
+        ["job_stockFixedBoxWidth", "stockFixedBoxWidth", "job_stockWidth", "stockWidth",
+        "job_stockFixedX", "stockFixedX", "job_stockFixedX"],  # <-- add these
         stock_x_mm
     )
     oky = _set_param(
         ["job_stockFixedBoxLength", "stockFixedBoxLength", "job_stockLength", "stockLength",
-         "job_stockFixedBoxHeight", "stockFixedBoxHeight"],  # some builds misuse “height” for Y
+        "job_stockFixedY", "stockFixedY", "job_stockFixedY"],  # <-- add these
         stock_y_mm
     )
     okz = _set_param(
-        ["job_stockFixedBoxHeight", "stockFixedBoxHeight", "job_stockThickness", "stockThickness"],
+        ["job_stockFixedBoxHeight", "stockFixedBoxHeight", "job_stockThickness", "stockThickness",
+        "job_stockFixedZ", "stockFixedZ", "job_stockFixedZ"],  # <-- add these
         stock_z_mm
     )
+
+    # Optional: force center modes if your build supports them
+    try:
+        for nm in ["job_stockFixedXMode", "job_stockFixedYMode", "job_stockFixedZMode"]:
+            p = setup.parameters.itemByName(nm)
+            if p:
+                try: p.value = "center"
+                except: p.expression = "center"
+    except:
+        pass
 
     try:
         log(f"Stock set (mm): X={stock_x_mm:.1f} Y={stock_y_mm:.1f} Z={stock_z_mm:.1f} ok=({okx},{oky},{okz})")
     except:
         pass
+
 
 def _set_wcs_top_center_after_verified(setup):
     """
@@ -1925,10 +1940,12 @@ def create_cam_for_sheets(cam, design, ui, sheets, enforce_orientation_cb=None):
             enforcement_failures += 1
             # Fallback: your existing build-specific param setter
             try:
+
+                sheet_w_expr_oriented, sheet_h_expr_oriented = _orient_sheet_exprs_long_y(design, SHEET_W, SHEET_H)
                 configure_stock_and_wcs_for_your_build(
                     setup,
-                    sheet_w_expr=SHEET_W,
-                    sheet_h_expr=SHEET_H,
+                    sheet_w_expr=sheet_w_expr_oriented,
+                    sheet_h_expr=sheet_h_expr_oriented,
                     sheet_thk_expr=SHEET_THK,
                     side_off_expr='0 mm',
                     top_off_expr='0 mm',
