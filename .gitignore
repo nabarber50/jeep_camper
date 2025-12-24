@@ -1,0 +1,4 @@
+# Repo ignores for jeep_camper
+# Ignore compiled Python files
+*.pyc
+__pycache__/

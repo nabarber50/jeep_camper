@@ -1,11 +1,29 @@
+import os, sys
+import traceback
+import adsk.core, adsk.fusion, adsk.cam
+
+# folder containing this entry script
+_here = os.path.dirname(os.path.abspath(__file__))
+
+# If your package lives next to this script as: <something>/foamcam/...
+# then the parent of that folder must be on sys.path.
+_repo_root = _here  # adjust if needed (see note below)
+
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
+# Optional: log the path so we can verify
+try:
+    with open(os.path.join(os.path.expanduser("~"), "fusion_foamcam_panic.log"), "a", encoding="utf-8") as f:
+        f.write("sys.path[0]=%s\n" % sys.path[0])
+except:
+    pass
+
 # cam/setup/foam_cam_template.py
 # ============================================================
 # Foam CAM Template – Multi-Sheet Nesting + CAM (Refactored)
 # Architectural cleanup: package modules + dataclasses
 # ============================================================
-
-import traceback
-import adsk.core, adsk.fusion, adsk.cam
 
 from foamcam.config import Config
 from foamcam.log import Logger
