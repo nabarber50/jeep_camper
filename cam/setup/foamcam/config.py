@@ -19,6 +19,8 @@ class Config:
         ("WIDE_6x10", 1828.8, 3048.0),
     ]
 
+    MASLOW_FORCE_WCS_ROTATE_90 = True
+
     # ---- Optional concave/U-shape pairing (experimental) ----
     ENABLE_U_PAIRING = True
     U_FILL_RATIO_MAX = 0.70

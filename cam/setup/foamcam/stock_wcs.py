@@ -58,12 +58,18 @@ class StockWcsEnforcer:
         return bool(ok)
 
     def _try_set_wcs_rotation_90(self, setup, rotate_90: bool) -> bool:
-        """
-        Many Fusion builds don't honor setup.workCoordinateSystemOrientation.rotationAngle.
-        So we try known param names that show up in dumps across builds.
-        """
         if not rotate_90:
             return True
+
+        # 0) Try API-based rotation first (works on some builds)
+        try:
+            wcs = getattr(setup, "workCoordinateSystemOrientation", None)
+            if wcs and hasattr(wcs, "rotationAngle"):
+                wcs.rotationAngle = math.radians(90.0)
+                self.logger.log("WCS rotation set via API: workCoordinateSystemOrientation.rotationAngle = 90deg")
+                return True
+        except Exception as e:
+            self.logger.log(f"WCS API rotation attempt failed: {e}")
 
         params = getattr(setup, "parameters", None)
         if not params:
@@ -74,11 +80,16 @@ class StockWcsEnforcer:
         candidates = [
             ("wcs_rotationAngle", "90 deg"),
             ("wcs_rotationAngle", "90"),
+            ("job_wcsRotationAngle", "90 deg"),
+            ("job_wcsRotationAngle", "90"),
             ("wcs_rotation", "90 deg"),
             ("wcs_rotation", "90"),
             ("job_wcsRotation", "90 deg"),
             ("job_wcsRotation", "90"),
+            ("wcsRotAngle", "90 deg"),
+            ("wcsRotAngle", "90"),
         ]
+
         for nm, expr in candidates:
             ok, used = set_param_expr_any(params, [nm], expr)
             if ok:
@@ -125,7 +136,7 @@ class StockWcsEnforcer:
 
         cname, stockX, stockY = pick
 
-        rotate_wcs_90 = bool(model_long_is_x)
+        rotate_wcs_90 = bool(getattr(self.Config, "MASLOW_FORCE_WCS_ROTATE_90", True))
 
         ok_stock = self._set_fixed_stock_box_mm(setup, stockX, stockY, stock_thk_mm)
         if not ok_stock:
