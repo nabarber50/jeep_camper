@@ -1,0 +1,247 @@
+# cam/setup/foamcam/cam_ops.py
+import adsk.core, adsk.cam
+from foamcam.models import CamBuildResult
+
+
+class CamBuilder:
+    def __init__(self, cam: adsk.cam.CAM, design, units, logger, Config, enforcer=None):
+        self.cam = cam
+        self.design = design
+        self.units = units
+        self.logger = logger
+        self.Config = Config
+        self.enforcer = enforcer
+
+    def _find_tool_best_effort(self):
+        name_key = (self.Config.PREFERRED_TOOL_NAME_CONTAINS or '').lower()
+
+        def scan_tools(tools):
+            try:
+                for i in range(tools.count):
+                    t = tools.item(i)
+                    try:
+                        if name_key and name_key in (t.name or '').lower():
+                            return t
+                    except:
+                        pass
+            except:
+                pass
+            return None
+
+        try:
+            app = adsk.core.Application.get()
+            cam_mgr = getattr(app, "camManager", None)
+            if cam_mgr:
+                lm = getattr(cam_mgr, "libraryManager", None)
+                if lm:
+                    libs = getattr(lm, "toolLibraries", None)
+                    if libs:
+                        for li in range(libs.count):
+                            lib = libs.item(li)
+                            tools = getattr(lib, "tools", None)
+                            if tools:
+                                t = scan_tools(tools)
+                                if t:
+                                    return t
+        except:
+            pass
+        return None
+
+    def _set_expr(self, params, name, expr):
+        try:
+            p = params.itemByName(name)
+            if p:
+                p.expression = expr
+                return True
+        except:
+            pass
+        return False
+
+    def _set_bool(self, params, name, val: bool):
+        try:
+            p = params.itemByName(name)
+            if p:
+                try:
+                    p.value = val
+                except:
+                    p.expression = 'true' if val else 'false'
+                return True
+        except:
+            pass
+        return False
+
+    def _apply_maslow_z(self, op: adsk.cam.Operation):
+        p = op.parameters
+
+        def set_expr(name, expr):
+            self._set_expr(p, name, expr)
+
+        set_expr('retractHeight_offset',   self.Config.MASLOW_RETRACT)
+        set_expr('clearanceHeight_offset', self.Config.MASLOW_CLEARANCE)
+        set_expr('feedHeight_offset',      self.Config.MASLOW_FEED)
+
+        set_expr('plungeFeedrate',   self.Config.MASLOW_PLUNGE_FEED)
+        set_expr('retractFeedrate',  self.Config.MASLOW_RETRACT_FEED)
+
+        set_expr('tool_feedPlunge',  self.Config.MASLOW_PLUNGE_FEED)
+        set_expr('tool_feedRetract', self.Config.MASLOW_RETRACT_FEED)
+
+        try:
+            ar = p.itemByName('allowRapidRetract')
+            if ar:
+                try:
+                    ar.value = False
+                except:
+                    ar.expression = 'false'
+        except:
+            pass
+
+    def _create_2d_contour_input_best_effort(self, ops, ui, warn_state: dict):
+        candidates = [
+            '2dContour','2DContour','contour2d','contour2D','Contour2D','2d-contour','2d_contour','2dContourOp',
+            '2dProfile','2DProfile','profile2d','profile2D','2d-profile','2d_profile',
+            'mill2dContour','Milling2DContour','trace',
+        ]
+        last_err = None
+        for s in candidates:
+            try:
+                return ops.createInput(s)
+            except Exception as e:
+                last_err = e
+
+        if not warn_state.get("warned", False):
+            warn_state["warned"] = True
+            ui.messageBox(
+                "This Fusion build does not expose a 2D Contour strategy ID via API.\n\n"
+                "Workaround:\n"
+                "- Script will create Adaptive + Scallop.\n"
+                "- Add 2D Contour manually once, then save as a Template.\n\n"
+                f"Last error: {last_err}"
+            )
+        return None
+
+    def create_for_sheets(self, sheets, ui) -> CamBuildResult:
+        warn_state = {"warned": False}
+        tool = None
+
+        try:
+            tool = self._find_tool_best_effort()
+            if tool:
+                self.logger.log(f"Tool auto-picked: {tool.name}")
+            else:
+                self.logger.log("Tool auto-pick unavailable; ops will be created without tool selection.")
+        except:
+            tool = None
+
+        def try_assign_tool(op):
+            if not tool:
+                return
+            try:
+                op.tool = tool
+            except:
+                pass
+
+        result = CamBuildResult()
+
+        for sheet in sheets:
+            occ = sheet.occ
+
+            setup_in = self.cam.setups.createInput(adsk.cam.OperationTypes.MillingOperation)
+            setup = self.cam.setups.add(setup_in)
+            try:
+                setup.name = f'CAM_{occ.component.name}'
+            except:
+                setup.name = 'CAM_Sheet'
+
+            # models = all solid bodies in sheet component
+            coll = adsk.core.ObjectCollection.create()
+            model_bodies = []
+            try:
+                for b in occ.component.bRepBodies:
+                    if b and b.isSolid:
+                        coll.add(b)
+                        model_bodies.append(b)
+            except:
+                pass
+
+            try:
+                setup.models = coll
+            except:
+                pass
+
+            try:
+                setup.stockMode = adsk.cam.SetupStockModes.FixedBoxStock
+            except:
+                pass
+
+            # enforce orientation + stock + origin (best effort)
+            enforced_ok = False
+            if self.enforcer:
+                try:
+                    self.enforcer.enforce(setup, model_bodies)
+                    enforced_ok = True
+                except Exception as e:
+                    result.enforcement_failures += 1
+                    self.logger.log(f"{setup.name}: orientation enforcement FAILED: {e}")
+
+            ops = setup.operations
+
+            # 2D contour best effort
+            prof_in = None
+            try:
+                prof_in = self._create_2d_contour_input_best_effort(ops, ui, warn_state)
+            except:
+                prof_in = None
+
+            if prof_in:
+                prof_in.displayName = 'Foam Cutout 2D (Profile)'
+                prof = ops.add(prof_in)
+                try_assign_tool(prof)
+
+                self._set_bool(prof.parameters, 'doRoughingPasses', True)
+                self._set_bool(prof.parameters, 'doMultipleDepths', True)
+                self._set_expr(prof.parameters, 'maximumStepdown', self.Config.PROFILE_STEPDOWN)
+
+                self._apply_maslow_z(prof)
+
+            # 3D adaptive
+            try:
+                rough_in = ops.createInput('adaptive')
+                rough_in.displayName = 'Foam Rough 3D (Adaptive)'
+                rough = ops.add(rough_in)
+                try_assign_tool(rough)
+
+                self._set_expr(rough.parameters, 'maximumStepdown', self.Config.ROUGH_STEPDOWN)
+                self._apply_maslow_z(rough)
+            except Exception as e:
+                ui.messageBox(f"Failed creating Adaptive op in {setup.name}:\n{e}")
+
+            # 3D scallop
+            try:
+                fin_in = ops.createInput('scallop')
+                fin_in.displayName = 'Foam Finish 3D (Scallop)'
+                fin = ops.add(fin_in)
+                try_assign_tool(fin)
+
+                self._set_expr(fin.parameters, 'finishingStepdown', self.Config.FINISH_STEPDOWN)
+                self._set_expr(fin.parameters, 'maximumStepdown', self.Config.FINISH_STEPDOWN)
+                self._apply_maslow_z(fin)
+            except Exception as e:
+                ui.messageBox(f"Failed creating Scallop op in {setup.name}:\n{e}")
+
+            result.setups_created += 1
+            try:
+                adsk.doEvents()
+            except:
+                pass
+
+        ui.messageBox(
+            "CAM creation complete.\n\n"
+            f"Setups created: {result.setups_created}\n"
+            f"Orientation enforcement failures: {result.enforcement_failures}\n\n"
+            "Notes:\n"
+            "- If 2D Contour cannot be created by API, add it manually once and save a Template.\n"
+            "- If Maslow is still 90° off, your build likely needs a different WCS rotation param —\n"
+            "  run once and paste the WCS-related param dump from the log."
+        )
+        return result
