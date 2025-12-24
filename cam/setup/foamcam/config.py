@@ -19,8 +19,6 @@ class Config:
         ("WIDE_6x10", 1828.8, 3048.0),
     ]
 
-    MASLOW_FORCE_WCS_ROTATE_90 = True
-
     # ---- Optional concave/U-shape pairing (experimental) ----
     ENABLE_U_PAIRING = True
     U_FILL_RATIO_MAX = 0.70
@@ -53,6 +51,15 @@ class Config:
     MASLOW_FEED          = '1.0 mm'
     MASLOW_PLUNGE_FEED   = '300 mm/min'
     MASLOW_RETRACT_FEED  = '300 mm/min'
+
+    # ---- Maslow XY / WCS alignment ----
+    # If you consistently see the *long* axis of the cut coming out on the *short*
+    # axis of your physical stock in Maslow, set this True.
+    #
+    # This forces a 90° WCS rotation at CAM-setup time (equivalent to the manual
+    # "rotate the model 90°" workaround) without requiring you to rotate the
+    # foam on the frame.
+    MASLOW_FORCE_WCS_ROTATE_90 = True
 
     # ---- Stepdowns ----
     PROFILE_STEPDOWN = '6 mm'

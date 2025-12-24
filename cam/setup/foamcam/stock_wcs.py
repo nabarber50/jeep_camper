@@ -58,60 +58,106 @@ class StockWcsEnforcer:
         return bool(ok)
 
     def _try_set_wcs_rotation_90(self, setup, rotate_90: bool) -> bool:
-        if not rotate_90:
-            return True
+        """
+        Many Fusion builds don't honor setup.workCoordinateSystemOrientation.rotationAngle.
+        So we try known param names that show up in dumps across builds.
 
-        # 0) Try API-based rotation first (works on some builds)
-        try:
-            wcs = getattr(setup, "workCoordinateSystemOrientation", None)
-            if wcs and hasattr(wcs, "rotationAngle"):
-                wcs.rotationAngle = math.radians(90.0)
-                self.logger.log("WCS rotation set via API: workCoordinateSystemOrientation.rotationAngle = 90deg")
-                return True
-        except Exception as e:
-            self.logger.log(f"WCS API rotation attempt failed: {e}")
+        This has proven to be highly build-dependent, so we:
+          1) Try a small set of known parameter names.
+          2) Fall back to a heuristic scan of *all* setup parameters that look like WCS rotation.
+          3) As a last resort, try the API property if it exists on this build.
 
+        Returns True if we believe we set a 90° rotation when requested.
+        """
         params = getattr(setup, "parameters", None)
         if not params:
             return False
 
-        # 1) angle-style parameters (if present)
-        # Some builds store degrees, some radians; we try both tokens.
-        candidates = [
-            ("wcs_rotationAngle", "90 deg"),
-            ("wcs_rotationAngle", "90"),
-            ("job_wcsRotationAngle", "90 deg"),
-            ("job_wcsRotationAngle", "90"),
-            ("wcs_rotation", "90 deg"),
-            ("wcs_rotation", "90"),
-            ("job_wcsRotation", "90 deg"),
-            ("job_wcsRotation", "90"),
-            ("wcsRotAngle", "90 deg"),
-            ("wcsRotAngle", "90"),
-        ]
+        # When NOT rotating, we still try to explicitly clear rotation where possible.
+        target_exprs = ["90 deg", "90"] if rotate_90 else ["0 deg", "0"]
 
-        for nm, expr in candidates:
-            ok, used = set_param_expr_any(params, [nm], expr)
-            if ok:
-                self.logger.log(f"WCS rotation set via param {used} = {expr}")
-                return True
+        # 0) Try API property if present (some builds support it, many ignore it)
+        try:
+            wcs = getattr(setup, "workCoordinateSystemOrientation", None)
+            if wcs is not None:
+                try:
+                    # Some builds expect radians.
+                    wcs.rotationAngle = math.radians(90.0 if rotate_90 else 0.0)
+                except:
+                    pass
+        except:
+            pass
 
-        # 2) axis-swap style parameters (rare but exists)
-        # If there are explicit axis selection params, try swapping.
-        # NOTE: these names are speculative; dump will tell us what's real on your build.
-        axis_swap_attempts = [
-            ("wcs_axisX", "y"),
-            ("wcs_axisY", "x"),
-            ("wcs_xAxis", "y"),
-            ("wcs_yAxis", "x"),
+        # 1) angle-style parameters (known names across some builds)
+        known_names = [
+            "wcs_rotationAngle",
+            "wcs_rotation",
+            "job_wcsRotation",
+            "job_wcsRotationAngle",
+            # Seen in some manufacturing workspaces / posts
+            "job_wcsRotationZ",
+            "wcs_rotationZ",
+            "wcs_rotZ",
+            "job_setupWcsRotation",
+            "setup_wcsRotation",
+            "setup_wcsRotationAngle",
         ]
-        swapped_any = False
-        for nm, expr in axis_swap_attempts:
-            ok, used = set_param_expr_any(params, [nm], expr)
-            swapped_any = swapped_any or ok
-            if ok:
-                self.logger.log(f"WCS axis param set {used}={expr}")
-        return swapped_any
+        for nm in known_names:
+            for expr in target_exprs:
+                ok, used = set_param_expr_any(params, [nm], expr)
+                if ok:
+                    self.logger.log(f"WCS rotation set via param {used} = {expr}")
+                    return True
+
+        # 2) heuristic scan: any param that looks like a WCS rotation angle
+        #    (e.g. contains both 'wcs' and ('rot' or 'angle')).
+        heuristic_hits = []
+        try:
+            for p in params:
+                try:
+                    nm = getattr(p, "name", "")
+                    lnm = (nm or "").lower()
+                    if "wcs" not in lnm:
+                        continue
+                    if ("rot" not in lnm) and ("angle" not in lnm):
+                        continue
+                    heuristic_hits.append(nm)
+                except:
+                    continue
+        except:
+            heuristic_hits = []
+
+        for hit in heuristic_hits:
+            for expr in target_exprs:
+                ok, used = set_param_expr_any(params, [hit], expr)
+                if ok:
+                    self.logger.log(f"WCS rotation set via heuristic param {used} = {expr}")
+                    return True
+
+        # 3) axis-swap / XY-swap style parameters (rare)
+        swap_true  = ["true", "1"]
+        swap_false = ["false", "0"]
+        swap_exprs = swap_true if rotate_90 else swap_false
+        swap_names = []
+        try:
+            for p in params:
+                nm = getattr(p, "name", "")
+                lnm = (nm or "").lower()
+                if "wcs" not in lnm:
+                    continue
+                if ("swap" in lnm and ("xy" in lnm or "x" in lnm and "y" in lnm)) or ("flip" in lnm and ("xy" in lnm or "x" in lnm and "y" in lnm)):
+                    swap_names.append(nm)
+        except:
+            swap_names = []
+
+        for nm in swap_names:
+            for expr in swap_exprs:
+                ok, used = set_param_expr_any(params, [nm], expr)
+                if ok:
+                    self.logger.log(f"WCS XY swap set via param {used} = {expr}")
+                    return True
+
+        return False
 
     def enforce(self, setup, model_bodies) -> dict:
         """
@@ -136,7 +182,17 @@ class StockWcsEnforcer:
 
         cname, stockX, stockY = pick
 
-        rotate_wcs_90 = bool(getattr(self.Config, "MASLOW_FORCE_WCS_ROTATE_90", True))
+        # Decide whether to rotate the CAM WCS 90° about Z.
+        #
+        # We *prefer* the "automatic" rule (rotate when the model's long axis is X),
+        # but in practice Fusion/Post/Maslow combinations sometimes export XY swapped
+        # even when the sheet looks correct inside Fusion. When that happens, the most
+        # reliable fix is to force a 90° WCS rotation (equivalent to the old "rotate the
+        # model" workaround).
+        force_rot = bool(getattr(self.Config, "MASLOW_FORCE_WCS_ROTATE_90", False))
+        rotate_wcs_90 = True if force_rot else bool(model_long_is_x)
+        if force_rot:
+            self.logger.log("Maslow: forcing WCS rotation 90° (Config.MASLOW_FORCE_WCS_ROTATE_90=True)")
 
         ok_stock = self._set_fixed_stock_box_mm(setup, stockX, stockY, stock_thk_mm)
         if not ok_stock:
