@@ -12,11 +12,19 @@ class Config:
     DO_AUTO_LAYOUT = True
     LAYOUT_BASE_NAME = 'SHEET_LAYOUT_4x8'
 
+    # IMPORTANT AXIS CONVENTION (Maslow / most CNC):
+    #   +X = left/right (typically the LONG axis on a 4x8)
+    #   +Y = toward/away (typically the SHORT axis on a 4x8)
+    # If you jog +X and the router moves right, and you jog +Y and it moves away,
+    # that matches this convention.
+    #
+    # Therefore: sheet classes below are defined as (X_len_mm, Y_len_mm)
+    # with the LONG dimension as X for 4x8 / 4x10 / 4x12.
     SHEET_CLASSES = [
-        ("STD_4x8",   1219.2, 2438.4),
-        ("EXT_4x10",  1219.2, 3048.0),
-        ("EXT_4x12",  1219.2, 3657.6),
-        ("WIDE_6x10", 1828.8, 3048.0),
+        ("STD_4x8",   2438.4, 1219.2),
+        ("EXT_4x10",  3048.0, 1219.2),
+        ("EXT_4x12",  3657.6, 1219.2),
+        ("WIDE_6x10", 3048.0, 1828.8),
     ]
 
     # ---- Optional concave/U-shape pairing (experimental) ----
@@ -51,15 +59,6 @@ class Config:
     MASLOW_FEED          = '1.0 mm'
     MASLOW_PLUNGE_FEED   = '300 mm/min'
     MASLOW_RETRACT_FEED  = '300 mm/min'
-
-    # ---- Maslow XY / WCS alignment ----
-    # If you consistently see the *long* axis of the cut coming out on the *short*
-    # axis of your physical stock in Maslow, set this True.
-    #
-    # This forces a 90° WCS rotation at CAM-setup time (equivalent to the manual
-    # "rotate the model 90°" workaround) without requiring you to rotate the
-    # foam on the frame.
-    MASLOW_FORCE_WCS_ROTATE_90 = True
 
     # ---- Stepdowns ----
     PROFILE_STEPDOWN = '6 mm'
