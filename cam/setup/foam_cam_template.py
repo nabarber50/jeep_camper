@@ -32,7 +32,7 @@ from foamcam.collect import collect_layout_bodies
 from foamcam.nesting import SheetNester
 from foamcam.cam_ops import CamBuilder
 from foamcam.stock_wcs import StockWcsEnforcer
-
+from foamcam.helpers import get_cam_product
 
 def run(context):
     ui = None
@@ -92,16 +92,10 @@ def run(context):
 
         # 3) CAM
         logger.log("Acquiring CAM product...")
-        cam = adsk.cam.CAM.cast(doc.products.itemByProductType('CAMProductType'))
+        cam = get_cam_product(app, ui, doc)
         if not cam:
-            # best effort activation
-            try:
-                cam_ws = ui.workspaces.itemById('CAMEnvironment')
-                if cam_ws:
-                    cam_ws.activate()
-                cam = adsk.cam.CAM.cast(doc.products.itemByProductType('CAMProductType'))
-            except:
-                cam = None
+            ui.messageBox("CAM product not available... etc")
+            return
 
         logger.log(f"CAM loaded: {bool(cam)}")
         if not cam:
