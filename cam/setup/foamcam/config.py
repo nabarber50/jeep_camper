@@ -2,7 +2,9 @@
 import os
 import re
 
-class Config:
+from .helpers import get_desktop_path
+
+class Config(object):
     # ----------------------------
     # CONFIG (ported from your script)
     # ----------------------------
@@ -71,5 +73,6 @@ class Config:
     ROUGH_STEPDOWN   = '6 mm'
     FINISH_STEPDOWN  = '2 mm'
 
-    LOG_PATH = os.path.join(os.path.expanduser("~"), "Desktop", "foam_cam_template_log.txt")
+    LOG_PATH = os.path.join(get_desktop_path(), "fusion_cam_log.txt")
+    # LOG_PATH = "c:/Users/nabar/fusion_foamcam_panic.log"
     LAYER_NAME_RE = re.compile(r'^Layer_\d+_part_\d+$', re.IGNORECASE)
