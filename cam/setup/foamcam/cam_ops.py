@@ -1,5 +1,6 @@
 # cam/setup/foamcam/cam_ops.py
-import adsk.core, adsk.cam
+import adsk.core, adsk.cam, adsk.fusion
+import math
 from foamcam.models import CamBuildResult
 
 
@@ -11,6 +12,62 @@ class CamBuilder:
         self.logger = logger
         self.Config = Config
         self.enforcer = enforcer
+
+    def _apply_xy_swap_compensation_rotation(self, sheet_component) -> bool:
+        """If enabled, rotate the sheet component bodies +90° about Z.
+
+        This is a pragmatic fix for pipelines where the Maslow sender/post
+        effectively swaps X/Y at runtime. By rotating the nested sheet bodies
+        in Fusion and swapping stock dims, the downstream swap cancels out.
+
+        The rotation is applied at most once per sheet component (tracked by
+        a component attribute).
+        """
+        if not bool(getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', False)):
+            return False
+
+        try:
+            attrs = getattr(sheet_component, 'attributes', None)
+            if attrs:
+                existing = attrs.itemByName('foamcam', 'xy_swap_compensated')
+                if existing:
+                    return False
+        except:
+            pass
+
+        try:
+            bodies = adsk.core.ObjectCollection.create()
+            for b in sheet_component.bRepBodies:
+                try:
+                    if b and b.isSolid:
+                        bodies.add(b)
+                except:
+                    pass
+
+            if bodies.count == 0:
+                return False
+
+            mf = sheet_component.features.moveFeatures
+            m = adsk.core.Matrix3D.create()
+            m.setToRotation(
+                math.radians(90.0),
+                adsk.core.Vector3D.create(0, 0, 1),
+                adsk.core.Point3D.create(0, 0, 0)
+            )
+            inp = mf.createInput(bodies, m)
+            mf.add(inp)
+
+            try:
+                if attrs:
+                    attrs.add('foamcam', 'xy_swap_compensated', '1')
+            except:
+                pass
+
+            self.logger.log('Applied MASLOW_SWAP_XY_COMPENSATION: rotated sheet bodies +90° about Z.')
+            return True
+        except:
+            self.logger.log('WARNING: MASLOW_SWAP_XY_COMPENSATION rotation failed; continuing without rotation.')
+            return False
 
     def _find_tool_best_effort(self):
         name_key = (self.Config.PREFERRED_TOOL_NAME_CONTAINS or '').lower()
@@ -152,6 +209,12 @@ class CamBuilder:
                 setup.name = f'CAM_{occ.component.name}'
             except:
                 setup.name = 'CAM_Sheet'
+
+            # If Maslow X/Y swap compensation is enabled, rotate the sheet
+            # bodies in-place before we compute extents and set stock/WCS.
+            # This mirrors the manual "rotate the model 90°" workaround that
+            # previously fixed jobs that ran along the wrong physical axis.
+            self._apply_xy_swap_compensation_rotation(occ.component)
 
             # models = all solid bodies in sheet component
             coll = adsk.core.ObjectCollection.create()

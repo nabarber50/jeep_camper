@@ -16,10 +16,22 @@ class StockWcsEnforcer:
         req_w = model_w_mm + 2.0 * margin_mm
         req_h = model_h_mm + 2.0 * margin_mm
 
+        # Some Maslow sender/post pipelines effectively swap X/Y at runtime.
+        # If that happens, the most reliable way to cancel it is:
+        #   - treat Fusion's STOCK long axis as X (not Y)
+        #   - rotate the placed model in the sheet component by 90° so it
+        #     fits that swapped stock box
+        # This makes the exported G-code come out swapped, so after the
+        # downstream swap you get the correct physical direction.
+        compensate_xy = bool(getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', False))
+
         for cname, sw, sh in self.Config.SHEET_CLASSES:
-            # Config.SHEET_CLASSES are defined as (stockX_mm, stockY_mm)
-            stockX = max(sw, sh)  # long axis
-            stockY = min(sw, sh)
+            long_mm = max(sw, sh)
+            short_mm = min(sw, sh)
+
+            # Default is stockY=long, stockX=short.
+            # When compensating, flip it so stockX=long, stockY=short.
+            stockX, stockY = (long_mm, short_mm) if compensate_xy else (short_mm, long_mm)
 
             if (req_w <= stockX and req_h <= stockY) or (req_h <= stockX and req_w <= stockY):
                 return (cname, stockX, stockY)
@@ -106,17 +118,17 @@ class StockWcsEnforcer:
     def enforce(self, setup, model_bodies) -> dict:
         """
         Core rule:
-          - Most CNC/Maslow convention: +X = left/right, +Y = away/toward you.
-          - On a fixed 4x8 frame, the LONG axis is typically X.
-          - Therefore we enforce: Fusion +X is the long sheet direction.
-          - If the model's long axis is Y, rotate WCS 90° so toolpaths align.
+          - Maslow +Y moves away from you
+          - Fusion +Y MUST be the long sheet direction
+          - If model long axis is X, rotate WCS 90° so toolpaths align
         Also ensures stock >= model and only then sets origin top-center.
         """
         ex = model_xy_extents_mm(model_bodies)
         if not ex:
             raise RuntimeError("Could not compute model extents (no bodies?).")
         model_x, model_y = ex
-        model_long_is_y = (model_y > model_x)
+        model_long_is_x = (model_x >= model_y)
+        compensate_xy = bool(getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', False))
 
         margin_mm = self.units.eval_mm(self.Config.LAYOUT_MARGIN)
         stock_thk_mm = self.units.eval_mm(self.Config.SHEET_THK)
@@ -127,9 +139,12 @@ class StockWcsEnforcer:
 
         cname, stockX, stockY = pick
 
-        # If the model is 'taller' in Y than X, rotate it 90° in WCS so
-        # its long direction becomes X (matches stock long axis).
-        rotate_wcs_90 = bool(model_long_is_y)
+        # Normal rule: if model long axis is X, rotate WCS 90 so toolpaths
+        # align with long-Y stock.
+        # When compensating an external X/Y swap, we instead rotate the *model*
+        # bodies inside the sheet component (see cam_ops.py) and keep WCS
+        # rotation off here.
+        rotate_wcs_90 = bool(model_long_is_x) if not compensate_xy else False
 
         ok_stock = self._set_fixed_stock_box_mm(setup, stockX, stockY, stock_thk_mm)
         if not ok_stock:
@@ -144,7 +159,9 @@ class StockWcsEnforcer:
 
         # WCS rotation (param based best effort)
         rot_ok = self._try_set_wcs_rotation_90(setup, rotate_wcs_90)
-        if rotate_wcs_90:
+        if compensate_xy:
+            self.logger.log("NOTE: MASLOW_SWAP_XY_COMPENSATION=True -> WCS rotation disabled; model rotation handled per-sheet.")
+        elif rotate_wcs_90:
             self.logger.log(f"WCS rotation requested (90°): success={rot_ok}")
 
         # origin
