@@ -141,12 +141,28 @@ class StockWcsEnforcer:
 
         # Normal rule: if model long axis is X, rotate WCS 90 so toolpaths
         # align with long-Y stock.
-        # When compensating an external X/Y swap, we instead rotate the *model*
-        # bodies inside the sheet component (see cam_ops.py) and keep WCS
-        # rotation off here.
-        rotate_wcs_90 = bool(model_long_is_x) if not compensate_xy else False
+        #
+        # IMPORTANT (Maslow "90° off" fix):
+        # In practice, some Maslow workflows behave as if Fusion X/Y are swapped
+        # at post/load time even when jogging looks correct. In that case, the
+        # safest deterministic fix is to force a 90° WCS rotation in Fusion so
+        # the posted G-code swaps X/Y.
+        #
+        # We keep the stock box dimensions in Fusion's native X/Y (stockX=min,
+        # stockY=max), and rely on the forced WCS rotation to make the toolpath
+        # align with the physical long axis.
+        rotate_wcs_90 = bool(model_long_is_x) or bool(compensate_xy)
 
-        ok_stock = self._set_fixed_stock_box_mm(setup, stockX, stockY, stock_thk_mm)
+        # Always set the stock box in Fusion's native axes.
+        set_stock_x = stockX
+        set_stock_y = stockY
+
+        if compensate_xy:
+            self.logger.log(
+                "MASLOW_SWAP_XY_COMPENSATION enabled: forcing WCS 90° rotation (toolpath X/Y swap) while keeping stock dims native."
+            )
+
+        ok_stock = self._set_fixed_stock_box_mm(setup, set_stock_x, set_stock_y, stock_thk_mm)
         if not ok_stock:
             dump_setup_params(self.logger, setup)
             raise RuntimeError("Failed to set fixed stock box dimensions (no matching stock params found).")
@@ -154,14 +170,15 @@ class StockWcsEnforcer:
         # verify fit before setting origin
         fit_x = (model_y if rotate_wcs_90 else model_x) + 2.0 * margin_mm
         fit_y = (model_x if rotate_wcs_90 else model_y) + 2.0 * margin_mm
-        if fit_x > stockX + 1e-6 or fit_y > stockY + 1e-6:
-            raise RuntimeError(f"Stock too small after orientation. Need {fit_x:.1f}x{fit_y:.1f}, have {stockX:.1f}x{stockY:.1f}")
+        # Compare against the dimensions we actually set on the setup.
+        if fit_x > set_stock_x + 1e-6 or fit_y > set_stock_y + 1e-6:
+            raise RuntimeError(
+                f"Stock too small after orientation. Need {fit_x:.1f}x{fit_y:.1f}, have {set_stock_x:.1f}x{set_stock_y:.1f}"
+            )
 
         # WCS rotation (param based best effort)
         rot_ok = self._try_set_wcs_rotation_90(setup, rotate_wcs_90)
-        if compensate_xy:
-            self.logger.log("NOTE: MASLOW_SWAP_XY_COMPENSATION=True -> WCS rotation disabled; model rotation handled per-sheet.")
-        elif rotate_wcs_90:
+        if rotate_wcs_90:
             self.logger.log(f"WCS rotation requested (90°): success={rot_ok}")
 
         # origin
@@ -180,8 +197,16 @@ class StockWcsEnforcer:
             self.logger.log("WARNING: failed to hard-lock stock; Fusion may resize it.")
 
         self.logger.log(
-            f"Setup orientation complete: sheetClass={cname} stockX={stockX:.1f} stockY={stockY:.1f} "
+            f"Setup orientation complete: sheetClass={cname} stockX={set_stock_x:.1f} stockY={set_stock_y:.1f} "
+            f"(nativeClassX={stockX:.1f} nativeClassY={stockY:.1f}, compensateXY={compensate_xy}) "
             f"modelX={model_x:.1f} modelY={model_y:.1f} rotateWCS90={rotate_wcs_90} rotParamOK={rot_ok}"
         )
 
-        return {"sheetClass": cname, "rotateWCS90": rotate_wcs_90, "stockX": stockX, "stockY": stockY, "rotParamOK": rot_ok}
+        return {
+            "sheetClass": cname,
+            "rotateWCS90": rotate_wcs_90,
+            "stockX": set_stock_x,
+            "stockY": set_stock_y,
+            "rotParamOK": rot_ok,
+            "compensateXY": compensate_xy,
+        }

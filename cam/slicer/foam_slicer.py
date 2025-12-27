@@ -1,4 +1,9 @@
-import adsk.core, adsk.fusion, adsk.cam, traceback, math, os
+import os
+import math
+import traceback
+import adsk.core
+import adsk.fusion
+
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
@@ -38,6 +43,46 @@ SLICE_SPACING_EXPR   = '4 in'            # gap between slice footprints
 
 # ----------------------------------------------------------------------
 
+
+def rotate_component_bodies_90deg_z(target_comp, logger=None):
+    """
+    Rotate all solid bodies in target_comp +90° about Z
+    so long axis becomes +Y (Maslow long axis).
+    """
+
+    bodies = adsk.core.ObjectCollection.create()
+    for b in target_comp.bRepBodies:
+        if b.isSolid:
+            bodies.add(b)
+
+    if bodies.count == 0:
+        if logger:
+            logger.log("Rotation skipped: no solid bodies found.")
+        return
+
+    # Compute a stable pivot (model center in XY)
+    min_x = min(b.boundingBox.minPoint.x for b in bodies)
+    max_x = max(b.boundingBox.maxPoint.x for b in bodies)
+    min_y = min(b.boundingBox.minPoint.y for b in bodies)
+    max_y = max(b.boundingBox.maxPoint.y for b in bodies)
+
+    cx = (min_x + max_x) * 0.5
+    cy = (min_y + max_y) * 0.5
+
+    pivot = adsk.core.Point3D.create(cx, cy, 0)
+
+    rot = adsk.core.Matrix3D.create()
+    rot.setToRotation(
+        math.radians(90.0),                    # ← key line
+        adsk.core.Vector3D.create(0, 0, 1),     # Z axis
+        pivot
+    )
+
+    move_feats = target_comp.features.moveFeatures
+    move_feats.add(bodies, rot)
+
+    if logger:
+        logger.log("Slicer: rotated all bodies +90° about Z (Maslow Y-long enforced).")
 
 def find_target_occurrence(root: adsk.fusion.Component) -> adsk.fusion.Occurrence:
     """
@@ -392,6 +437,7 @@ def slice_in_new_design(app: adsk.core.Application, ui: adsk.core.UserInterface,
                         ui.messageBox(
                             f'Failed to export STL for slice {idx:02d} part {part_idx:02d}:\n{e}'
                         )
+    rotate_component_bodies_90deg_z(target_comp, logger)
 
     ui.messageBox(
         'Slicing in NEW design complete.\n\n'

@@ -47,12 +47,45 @@ class CamBuilder:
             if bodies.count == 0:
                 return False
 
+            # Rotate about the sheet body's own center, not world origin.
+            # Rotating about (0,0,0) will "orbit" the whole nested layout and
+            # can appear correct in Fusion but post wrong / drift across runs.
+            bbox = None
+            for i in range(bodies.count):
+                b = bodies.item(i)
+                try:
+                    bb = b.boundingBox
+                    if not bb:
+                        continue
+                    if bbox is None:
+                        bbox = bb
+                    else:
+                        # expand bbox
+                        mn = bbox.minPoint
+                        mx = bbox.maxPoint
+                        bbmn = bb.minPoint
+                        bbmx = bb.maxPoint
+                        mn = adsk.core.Point3D.create(min(mn.x, bbmn.x), min(mn.y, bbmn.y), min(mn.z, bbmn.z))
+                        mx = adsk.core.Point3D.create(max(mx.x, bbmx.x), max(mx.y, bbmx.y), max(mx.z, bbmx.z))
+                        bbox = adsk.core.BoundingBox3D.create(mn, mx)
+                except:
+                    pass
+
+            pivot = adsk.core.Point3D.create(0, 0, 0)
+            try:
+                if bbox:
+                    mn = bbox.minPoint
+                    mx = bbox.maxPoint
+                    pivot = adsk.core.Point3D.create((mn.x + mx.x) / 2.0, (mn.y + mx.y) / 2.0, (mn.z + mx.z) / 2.0)
+            except:
+                pass
+
             mf = sheet_component.features.moveFeatures
             m = adsk.core.Matrix3D.create()
             m.setToRotation(
                 math.radians(90.0),
                 adsk.core.Vector3D.create(0, 0, 1),
-                adsk.core.Point3D.create(0, 0, 0)
+                pivot
             )
             inp = mf.createInput(bodies, m)
             mf.add(inp)
