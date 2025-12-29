@@ -24,6 +24,39 @@ class AppLogger(object):
             with open(self.path, "a+", encoding="utf-8") as f:
                 f.write(line + "\n")
                 f.flush()
+
+                # Dev instrumentation: detect unexpected rotation log messages
+                try:
+                    if "Applied MASLOW_SWAP_XY_COMPENSATION" in msg:
+                        f.write("[ROTATION_DETECT] Detected rotation message; dumping Python stack:\n")
+                        import inspect
+                        stack = inspect.stack()
+                        # Skip the logger frame itself and report the first 20 frames
+                        for fr in stack[1:21]:
+                            fn = fr.filename
+                            ln = fr.lineno
+                            nm = fr.function
+                            f.write(f"  File \"{fn}\", line {ln}, in {nm}\n")
+                        f.write("[ROTATION_DETECT] End stack dump.\n")
+                        f.flush()
+
+                        # If configured, fail-fast so user sees traceback in console
+                        try:
+                            from foamcam.config import Config
+                        except Exception:
+                            try:
+                                from .config import Config
+                            except Exception:
+                                Config = None
+                        try:
+                            if Config and getattr(Config, 'DEBUG_FAIL_ON_ROTATION', False):
+                                raise RuntimeError('DEBUG_FAIL_ON_ROTATION: rotation log detected in logger')
+                        except Exception:
+                            # If we raise here it will bubble out; let that happen intentionally
+                            raise
+                except Exception:
+                    # Avoid letting logger instrumentation crash silently; re-raise if it was intentional fail-fast
+                    raise
         except Exception as e:
             # Don't fail silently. Surface it (optionally) and/or raise.
             details = (

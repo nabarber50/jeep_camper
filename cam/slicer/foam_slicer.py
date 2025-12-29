@@ -4,7 +4,7 @@ import traceback
 import adsk.core
 import adsk.fusion
 
-
+from .logging import AppLogger
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
@@ -22,6 +22,18 @@ STEP_EXPORT_PATH = r'C:\temp\camper_base_slice.step'
 APPLY_ROTATION   = True        # set False if you don't want any rotation
 ROTATION_AXIS    = 'X'         # 'X', 'Y', or 'Z'
 ROTATION_DEGREES = 90.0        # angle in degrees; flip sign if orientation is flipped
+
+# Enforce that the model's long axis ends up along +Y by applying a
+# +90° rotation about Z only when the X extent is greater than the Y extent.
+# Set this to False to disable the automatic long-axis rotation.
+ENFORCE_LONG_AXIS_Y = True
+
+# Try to honor the higher-level setup config if available (e.g. when running
+# from the package `cam/setup/foamcam`). If the import fails we fall back.
+try:
+    from ..setup.foamcam.config import Config  # type: ignore
+except Exception:
+    Config = None
 
 # ---- New goodies -----------------------------------------------------
 
@@ -60,6 +72,18 @@ def rotate_component_bodies_90deg_z(target_comp, logger=None):
             logger.log("Rotation skipped: no solid bodies found.")
         return
 
+    # Config opt-in: require explicit True on both flags to rotate sheet bodies.
+    try:
+        if Config is None or getattr(Config, 'MASLOW_SWAP_XY_COMPENSATION', False) is not True or getattr(Config, 'MASLOW_ROTATE_SHEET_BODIES', False) is not True:
+            if logger:
+                logger.log(f"Slicer: rotation suppressed (MASLOW_SWAP_XY_COMPENSATION={getattr(Config,'MASLOW_SWAP_XY_COMPENSATION',None)} MASLOW_ROTATE_SHEET_BODIES={getattr(Config,'MASLOW_ROTATE_SHEET_BODIES',None)})")
+            return
+    except Exception:
+        # On any failure checking config, be conservative and skip rotation
+        if logger:
+            logger.log("Slicer: rotation suppressed due to config check error")
+        return
+
     # Compute a stable pivot (model center in XY)
     min_x = min(b.boundingBox.minPoint.x for b in bodies)
     max_x = max(b.boundingBox.maxPoint.x for b in bodies)
@@ -79,7 +103,17 @@ def rotate_component_bodies_90deg_z(target_comp, logger=None):
     )
 
     move_feats = target_comp.features.moveFeatures
-    move_feats.add(bodies, rot)
+    move_input = move_feats.createInput(bodies, rot)
+
+    # Dev-only fail-fast guard (disabled by default)
+    try:
+        if Config and getattr(Config, 'DEBUG_FAIL_ON_ROTATION', False):
+            raise RuntimeError('DEBUG_FAIL_ON_ROTATION triggered in foam_slicer.rotate_component_bodies_90deg_z')
+    except Exception:
+        # If Config is not available or check fails, ignore and continue
+        pass
+
+    move_feats.add(move_input)
 
     if logger:
         logger.log("Slicer: rotated all bodies +90° about Z (Maslow Y-long enforced).")
@@ -103,7 +137,7 @@ def find_target_occurrence(root: adsk.fusion.Component) -> adsk.fusion.Occurrenc
 
 def slice_in_new_design(app: adsk.core.Application, ui: adsk.core.UserInterface,
                         step_path: str, foam_thickness_expr: str,
-                        source_camera: adsk.core.Camera):
+                        source_camera: adsk.core.Camera, logger: AppLogger):
     """
     Create a new Fusion design, import the STEP at step_path,
     slice into foam layers along Y, then optionally:
@@ -437,7 +471,29 @@ def slice_in_new_design(app: adsk.core.Application, ui: adsk.core.UserInterface,
                         ui.messageBox(
                             f'Failed to export STL for slice {idx:02d} part {part_idx:02d}:\n{e}'
                         )
-    rotate_component_bodies_90deg_z(target_comp, logger)
+    # Optionally enforce long-axis along +Y: rotate +90° about Z only when X is the long axis
+    if ENFORCE_LONG_AXIS_Y:
+        # Allow a package-level config (if present) to disable rotations
+        config_allows = True
+        if 'Config' in globals() and Config is not None:
+            config_allows = getattr(Config, 'ALLOW_ROTATE_90', True)
+            if not config_allows and logger:
+                logger.log("Slicer: Config.ALLOW_ROTATE_90 is False; skipping long-axis rotation.")
+
+        if config_allows:
+            try:
+                if logger:
+                    logger.log(f"Slicer: computed extents X={width_x:.3f} cm, Y={height:.3f} cm")
+                if width_x > height:
+                    rotate_component_bodies_90deg_z(target_comp, logger)
+                    if logger:
+                        logger.log("Slicer: applied +90° Z rotation to align long axis to +Y.")
+                else:
+                    if logger:
+                        logger.log("Slicer: long axis already along Y; no rotation applied.")
+            except Exception as e:
+                if logger:
+                    logger.log(f"Slicer: failed to apply long-axis rotation: {e}")
 
     ui.messageBox(
         'Slicing in NEW design complete.\n\n'
@@ -453,6 +509,7 @@ def run(context):
     try:
         app = adsk.core.Application.get()
         ui = app.userInterface
+        logger = AppLogger(path=r"C:\temp\test.out", ui=ui, raise_on_fail=True)
 
         doc = app.activeDocument
         if not doc:
@@ -525,7 +582,7 @@ def run(context):
         source_camera = app.activeViewport.camera
 
         # Now create new design and slice there
-        slice_in_new_design(app, ui, STEP_EXPORT_PATH, FOAM_THICKNESS_EXPR, source_camera)
+        slice_in_new_design(app, ui, STEP_EXPORT_PATH, FOAM_THICKNESS_EXPR, source_camera, logger=logger)
 
     except:
         if ui:

@@ -160,6 +160,21 @@ class SheetNester:
                 pivot = adsk.core.Point3D.create(bb.minPoint.x, bb.minPoint.y, 0.0)
                 R = adsk.core.Matrix3D.create()
                 R.setToRotation(math.radians(90.0), adsk.core.Vector3D.create(0, 0, 1), pivot)
+
+                # Dev-only fail-fast guard (disabled by default)
+                try:
+                    try:
+                        from foamcam.config import Config
+                    except Exception:
+                        try:
+                            from .config import Config
+                        except Exception:
+                            Config = None
+                    if Config and getattr(Config, 'DEBUG_FAIL_ON_ROTATION', False):
+                        raise RuntimeError('DEBUG_FAIL_ON_ROTATION triggered in nesting._copy_via_temp_cookie_cutter')
+                except Exception:
+                    pass
+
                 if not temp_mgr.transform(tmp, R):
                     return None
 

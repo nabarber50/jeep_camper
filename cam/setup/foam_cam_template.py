@@ -39,6 +39,28 @@ def run(context):
         doc = app.activeDocument
         _logger = AppLogger(path=Config.LOG_PATH, ui=ui, raise_on_fail=True)
         _logger.log("=== RUN START ===")
+        try:
+            # Unmistakable startup diagnostic to confirm which module and config are loaded at runtime
+            _logger.log(f"Startup diagnostics: template file={__file__} sys.path0={sys.path[0] if sys.path else ''}")
+            _logger.log(f"Config: MASLOW_SWAP_XY_COMPENSATION={getattr(Config,'MASLOW_SWAP_XY_COMPENSATION',None)} MASLOW_ROTATE_SHEET_BODIES={getattr(Config,'MASLOW_ROTATE_SHEET_BODIES',None)} ALLOW_ROTATE_90={getattr(Config,'ALLOW_ROTATE_90',None)}")
+            try:
+                import sys as _sys, inspect as _inspect
+                cfg_mod = _sys.modules.get(Config.__module__)
+                cfg_file = getattr(cfg_mod, '__file__', '<unknown>') if cfg_mod else '<module-not-loaded>'
+                _logger.log(f"Config module: {Config.__module__} file={cfg_file}")
+            except Exception as e:
+                _logger.log(f"Config module lookup failed: {e}")
+
+            try:
+                import foamcam as _foamcam
+                cam_ops_mod = _sys.modules.get('foamcam.cam_ops')
+                cam_ops_file = getattr(cam_ops_mod, '__file__', '<unknown>') if cam_ops_mod else '<module-not-loaded>'
+                _logger.log(f"foamcam package: file={getattr(_foamcam, '__file__', '<pkg>')} cam_ops={cam_ops_file}")
+            except Exception as e:
+                _logger.log(f"foamcam module lookup failed: {e}")
+
+        except Exception as e:
+            _logger.log(f"Startup diagnostics failed: {e}")
     except Exception as e:
         with open(os.path.join(os.path.expanduser("~"), "fusion_foamcam_panic.log"), "a", encoding="utf-8") as f:
             # f.write("sys.path[0]=%s\n" % sys.path[0])
@@ -117,6 +139,10 @@ def run(context):
         enforcer = StockWcsEnforcer(design, units, _logger, Config)
 
         builder = CamBuilder(cam, design, units, _logger, Config, enforcer=enforcer)
+
+        # Runtime monkey-patches removed — relying on permanent, code-level opt-in checks
+        _logger.log('MONKEYPATCH: removed runtime wrappers; rotations are now governed by explicit Config flags (MASLOW_ROTATE_SHEET_BODIES)')
+
         result = builder.create_for_sheets(sheets, ui)
 
         _logger.log("CAM creation complete.")

@@ -35,6 +35,17 @@ class Config(object):
     # cut runs the long direction along your physical long axis.
     MASLOW_SWAP_XY_COMPENSATION = True
 
+    # When True, rotate the sheet component bodies +90° about Z in addition to
+    # any WCS rotation. This used to be the hard-coded behavior; it can be
+    # surprising, so default is False. Set to True to preserve the original
+    # rotate-the-bodies compensation behavior.
+    MASLOW_ROTATE_SHEET_BODIES = False
+
+    # Developer-only guard: when True, raise a RuntimeError immediately before
+    # applying any sheet-body rotation so a stack trace can be captured during
+    # debugging. Default is False.
+    DEBUG_FAIL_ON_ROTATION = True
+
     # ---- Optional concave/U-shape pairing (experimental) ----
     ENABLE_U_PAIRING = True
     U_FILL_RATIO_MAX = 0.70

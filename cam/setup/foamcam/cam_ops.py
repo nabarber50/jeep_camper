@@ -2,6 +2,7 @@
 import adsk.core, adsk.cam, adsk.fusion
 import math
 from foamcam.models import CamBuildResult
+from foamcam.geometry import model_xy_extents_mm
 
 
 class CamBuilder:
@@ -13,54 +14,101 @@ class CamBuilder:
         self.Config = Config
         self.enforcer = enforcer
 
+        # Robust startup diagnostics for Config values (helps detect runtime mutations)
+        swap = getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', '<missing>')
+        r_val = getattr(self.Config, 'MASLOW_ROTATE_SHEET_BODIES', '<missing>')
+        try:
+            rotate_sheets = bool(r_val)
+        except Exception:
+            rotate_sheets = '<error>'
+        try:
+            self.logger.log(
+                f'CamBuilder init: MASLOW_SWAP_XY_COMPENSATION={swap} '
+                f'MASLOW_ROTATE_SHEET_BODIES_raw={r_val} '
+                f'MASLOW_ROTATE_SHEET_BODIES_bool={rotate_sheets} '
+                f'Config_id={id(self.Config)} type={type(self.Config)} dir_contains={"MASLOW_ROTATE_SHEET_BODIES" in dir(self.Config)}'
+            )
+        except Exception as e:
+            try:
+                self.logger.log(f'CamBuilder init diagnostic failed: {e}')
+            except:
+                pass
+
     def _apply_xy_swap_compensation_rotation(self, sheet_component) -> bool:
-        """If enabled, rotate the sheet component bodies +90° about Z.
+        """Guarded and concise implementation for sheet-body rotation.
 
-        This is a pragmatic fix for pipelines where the Maslow sender/post
-        effectively swaps X/Y at runtime. By rotating the nested sheet bodies
-        in Fusion and swapping stock dims, the downstream swap cancels out.
-
-        The rotation is applied at most once per sheet component (tracked by
-        a component attribute).
+        Decision is logged as a single line per sheet indicating rotated=True/False
+        and the reason. Rotation only occurs if both MASLOW_SWAP_XY_COMPENSATION
+        and MASLOW_ROTATE_SHEET_BODIES are True and the model's long axis is X.
         """
-        if not bool(getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', False)):
-            return False
-
         try:
-            attrs = getattr(sheet_component, 'attributes', None)
-            if attrs:
-                existing = attrs.itemByName('foamcam', 'xy_swap_compensated')
-                if existing:
-                    return False
-        except:
-            pass
+            try:
+                name = sheet_component.name
+            except:
+                name = '(unnamed sheet)'
 
-        try:
+            # Quick global check: require explicit True on MASLOW_SWAP_XY_COMPENSATION
+            if getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', False) is not True:
+                self.logger.log(
+                    f'ROTATION DECISION: sheet={name} rotated=False reason=MASLOW_SWAP_XY_COMPENSATION_NOT_TRUE '
+                    f'MASLOW_SWAP_XY_COMPENSATION={getattr(self.Config, "MASLOW_SWAP_XY_COMPENSATION", None)}'
+                )
+                return False
+
+            # Already compensated?
+            try:
+                attrs = getattr(sheet_component, 'attributes', None)
+                if attrs:
+                    existing = attrs.itemByName('foamcam', 'xy_swap_compensated')
+                    if existing:
+                        self.logger.log(f'ROTATION DECISION: sheet={name} rotated=False reason=ALREADY_COMPENSATED')
+                        return False
+            except:
+                pass
+
+            # Gather model bodies
             bodies = adsk.core.ObjectCollection.create()
+            model_bodies = []
             for b in sheet_component.bRepBodies:
                 try:
                     if b and b.isSolid:
                         bodies.add(b)
+                        model_bodies.append(b)
                 except:
                     pass
 
             if bodies.count == 0:
+                self.logger.log(f'ROTATION DECISION: sheet={name} rotated=False reason=NO_SOLID_BODIES')
                 return False
 
-            # Rotate about the sheet body's own center, not world origin.
-            # Rotating about (0,0,0) will "orbit" the whole nested layout and
-            # can appear correct in Fusion but post wrong / drift across runs.
+            # Check config opt-in for rotating sheet bodies: require explicit True
+            rotate_sheets = getattr(self.Config, 'MASLOW_ROTATE_SHEET_BODIES', False) is True
+            if not rotate_sheets:
+                self.logger.log(
+                    f'ROTATION DECISION: sheet={name} rotated=False reason=ROTATE_DISABLED_BY_CONFIG '
+                    f'MASLOW_ROTATE_SHEET_BODIES={getattr(self.Config, "MASLOW_ROTATE_SHEET_BODIES", None)}'
+                )
+                return False
+
+            # Extents check — avoid rotating if long axis already Y
+            ex = model_xy_extents_mm(model_bodies)
+            if ex:
+                mx, my = ex
+                if mx < my:
+                    self.logger.log(f'ROTATION DECISION: sheet={name} rotated=False reason=LONG_AXIS_ALREADY_Y modelX={mx:.1f} modelY={my:.1f}')
+                    return False
+
+            # Compute pivot (center of bounding box)
             bbox = None
             for i in range(bodies.count):
-                b = bodies.item(i)
                 try:
+                    b = bodies.item(i)
                     bb = b.boundingBox
                     if not bb:
                         continue
                     if bbox is None:
                         bbox = bb
                     else:
-                        # expand bbox
                         mn = bbox.minPoint
                         mx = bbox.maxPoint
                         bbmn = bb.minPoint
@@ -80,26 +128,34 @@ class CamBuilder:
             except:
                 pass
 
+            # Prepare rotation
             mf = sheet_component.features.moveFeatures
             m = adsk.core.Matrix3D.create()
-            m.setToRotation(
-                math.radians(90.0),
-                adsk.core.Vector3D.create(0, 0, 1),
-                pivot
-            )
-            inp = mf.createInput(bodies, m)
-            mf.add(inp)
+            m.setToRotation(math.radians(90.0), adsk.core.Vector3D.create(0, 0, 1), pivot)
 
+            # Dev-only fail-fast guard (disabled by default)
+            if bool(getattr(self.Config, 'DEBUG_FAIL_ON_ROTATION', False)):
+                raise RuntimeError(f'DEBUG_FAIL_ON_ROTATION triggered for sheet: {name}')
+
+            try:
+                inp = mf.createInput(bodies, m)
+                mf.add(inp)
+            except Exception as e:
+                self.logger.log(f'ROTATION DECISION: sheet={name} rotated=False reason=ROTATION_ADD_FAILED error={e}')
+                return False
+
+            # Mark as compensated
             try:
                 if attrs:
                     attrs.add('foamcam', 'xy_swap_compensated', '1')
             except:
                 pass
 
-            self.logger.log('Applied MASLOW_SWAP_XY_COMPENSATION: rotated sheet bodies +90° about Z.')
+            self.logger.log(f'ROTATION DECISION: sheet={name} rotated=True reason=APPLIED')
             return True
-        except:
-            self.logger.log('WARNING: MASLOW_SWAP_XY_COMPENSATION rotation failed; continuing without rotation.')
+
+        except Exception as e:
+            self.logger.log(f'ROTATION DECISION: sheet={name} rotated=False reason=EXCEPTION error={e}')
             return False
 
     def _find_tool_best_effort(self):
@@ -243,11 +299,17 @@ class CamBuilder:
             except:
                 setup.name = 'CAM_Sheet'
 
-            # If Maslow X/Y swap compensation is enabled, rotate the sheet
-            # bodies in-place before we compute extents and set stock/WCS.
-            # This mirrors the manual "rotate the model 90°" workaround that
-            # previously fixed jobs that ran along the wrong physical axis.
-            self._apply_xy_swap_compensation_rotation(occ.component)
+            # Caller-side guard: do not call rotation method unless both
+            # MASLOW_SWAP_XY_COMPENSATION and MASLOW_ROTATE_SHEET_BODIES are
+            # explicitly True. This prevents older in-memory implementations
+            # from performing an undesired rotation when the caller opts out.
+            caller_swap = getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', None)
+            caller_rotate = getattr(self.Config, 'MASLOW_ROTATE_SHEET_BODIES', None)
+            if caller_swap is True and caller_rotate is True:
+                self.logger.log(f'CALLSITE: invoking rotation: MASLOW_SWAP_XY_COMPENSATION={caller_swap} MASLOW_ROTATE_SHEET_BODIES={caller_rotate}')
+                self._apply_xy_swap_compensation_rotation(occ.component)
+            else:
+                self.logger.log(f'CALLSITE: skipping rotation: MASLOW_SWAP_XY_COMPENSATION={caller_swap} MASLOW_ROTATE_SHEET_BODIES={caller_rotate}')
 
             # models = all solid bodies in sheet component
             coll = adsk.core.ObjectCollection.create()

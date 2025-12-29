@@ -199,6 +199,21 @@ def _copy_body_to_component_via_temp(design: adsk.fusion.Design,
             pivot = adsk.core.Point3D.create(bb.minPoint.x, bb.minPoint.y, 0.0)
             R = adsk.core.Matrix3D.create()
             R.setToRotation(math.radians(90.0), adsk.core.Vector3D.create(0, 0, 1), pivot)
+
+            # Dev-only fail-fast guard (disabled by default)
+            try:
+                try:
+                    from .foamcam.config import Config
+                except Exception:
+                    try:
+                        from foamcam.config import Config
+                    except Exception:
+                        Config = None
+                if Config and getattr(Config, 'DEBUG_FAIL_ON_ROTATION', False):
+                    raise RuntimeError('DEBUG_FAIL_ON_ROTATION triggered in template_working._tmp_insert_rotate')
+            except Exception:
+                pass
+
             if not temp_mgr.transform(tmp, R):
                 return None
 
@@ -280,6 +295,21 @@ def _tmp_flatten_and_measure_footprint_mm(src_body, rot_90: bool):
             pivot = adsk.core.Point3D.create(bb.minPoint.x, bb.minPoint.y, 0.0)
             R = adsk.core.Matrix3D.create()
             R.setToRotation(math.radians(90.0), adsk.core.Vector3D.create(0, 0, 1), pivot)
+
+            # Dev-only fail-fast guard (disabled by default)
+            try:
+                try:
+                    from .foamcam.config import Config
+                except Exception:
+                    try:
+                        from foamcam.config import Config
+                    except Exception:
+                        Config = None
+                if Config and getattr(Config, 'DEBUG_FAIL_ON_ROTATION', False):
+                    raise RuntimeError('DEBUG_FAIL_ON_ROTATION triggered in template_working._tmp_flatten_and_measure_footprint_mm')
+            except Exception:
+                pass
+
             if not temp_mgr.transform(tmp, R):
                 return None
 
