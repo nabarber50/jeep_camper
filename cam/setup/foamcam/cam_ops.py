@@ -266,7 +266,15 @@ class CamBuilder:
             )
         return None
 
-    def create_for_sheets(self, sheets, ui) -> CamBuildResult:
+    def create_for_sheets(self, sheets, ui, rotate_sheets: bool = None, rotate_wcs: bool = None, swap_xy: bool = None) -> CamBuildResult:
+        """
+        Create CAM setups for each sheet layout.
+        
+        Parameters:
+          rotate_sheets: override MASLOW_ROTATE_SHEET_BODIES (None = use Config)
+          rotate_wcs: override auto WCS rotation in enforcer (None = auto-decide)
+          swap_xy: override MASLOW_SWAP_XY_COMPENSATION (None = use Config)
+        """
         warn_state = {"warned": False}
         tool = None
 
@@ -303,13 +311,14 @@ class CamBuilder:
             # MASLOW_SWAP_XY_COMPENSATION and MASLOW_ROTATE_SHEET_BODIES are
             # explicitly True. This prevents older in-memory implementations
             # from performing an undesired rotation when the caller opts out.
-            caller_swap = getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', None)
-            caller_rotate = getattr(self.Config, 'MASLOW_ROTATE_SHEET_BODIES', None)
+            # Respect parameter overrides first, then Config.
+            caller_swap = swap_xy if swap_xy is not None else getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', None)
+            caller_rotate = rotate_sheets if rotate_sheets is not None else getattr(self.Config, 'MASLOW_ROTATE_SHEET_BODIES', None)
             if caller_swap is True and caller_rotate is True:
-                self.logger.log(f'CALLSITE: invoking rotation: MASLOW_SWAP_XY_COMPENSATION={caller_swap} MASLOW_ROTATE_SHEET_BODIES={caller_rotate}')
+                self.logger.log(f'CALLSITE: invoking rotation: MASLOW_SWAP_XY_COMPENSATION={caller_swap} MASLOW_ROTATE_SHEET_BODIES={caller_rotate} (overrides: swap_xy={swap_xy} rotate_sheets={rotate_sheets})')
                 self._apply_xy_swap_compensation_rotation(occ.component)
             else:
-                self.logger.log(f'CALLSITE: skipping rotation: MASLOW_SWAP_XY_COMPENSATION={caller_swap} MASLOW_ROTATE_SHEET_BODIES={caller_rotate}')
+                self.logger.log(f'CALLSITE: skipping rotation: MASLOW_SWAP_XY_COMPENSATION={caller_swap} MASLOW_ROTATE_SHEET_BODIES={caller_rotate} (overrides: swap_xy={swap_xy} rotate_sheets={rotate_sheets})')
 
             # models = all solid bodies in sheet component
             coll = adsk.core.ObjectCollection.create()
@@ -336,7 +345,7 @@ class CamBuilder:
             enforced_ok = False
             if self.enforcer:
                 try:
-                    self.enforcer.enforce(setup, model_bodies)
+                    self.enforcer.enforce(setup, model_bodies, force_wcs_rotation=rotate_wcs, force_swap_xy=swap_xy)
                     enforced_ok = True
                 except Exception as e:
                     result.enforcement_failures += 1

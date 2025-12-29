@@ -1,10 +1,48 @@
 # cam/setup/foamcam/config.py
 import os
 import re
+import winreg
+from pathlib import Path
 
-from .helpers import get_desktop_path
 
 class Config(object):
+    @staticmethod
+    def get_desktop_path(as_path_object: bool = False):
+        """Return the Desktop path, respecting OneDrive redirection."""
+        desktop = None
+
+        # 1) Preferred: Windows 'User Shell Folders' registry value (OneDrive-aware)
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+            ) as key:
+                val, _typ = winreg.QueryValueEx(key, "Desktop")
+                desktop = os.path.expandvars(val)
+        except Exception:
+            desktop = None
+
+        # 2) Validate / normalize
+        if desktop:
+            desktop = os.path.normpath(desktop)
+            if os.path.isdir(desktop):
+                return Path(desktop) if as_path_object else desktop
+
+        # 3) Fallbacks
+        home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+
+        od = os.environ.get("OneDrive")
+        if od:
+            od_desktop = os.path.normpath(os.path.join(od, "Desktop"))
+            if os.path.isdir(od_desktop):
+                return Path(od_desktop) if as_path_object else od_desktop
+
+        fallback = os.path.normpath(os.path.join(home, "Desktop"))
+        if os.path.isdir(fallback):
+            return Path(fallback) if as_path_object else fallback
+
+        return Path(home) if as_path_object else home
+
     # ----------------------------
     # CONFIG (ported from your script)
     # ----------------------------
@@ -15,9 +53,9 @@ class Config(object):
     LAYOUT_BASE_NAME = 'SHEET_LAYOUT_4x8'
 
     SHEET_CLASSES = [
-        ("STD_4x8",   1219.2, 2438.4),
-        ("EXT_4x10",  1219.2, 3048.0),
-        ("EXT_4x12",  1219.2, 3657.6),
+        ("STD_4x8", 1219.2, 2438.4),
+        ("EXT_4x10", 1219.2, 3048.0),
+        ("EXT_4x12", 1219.2, 3657.6),
         ("WIDE_6x10", 1828.8, 3048.0),
     ]
 
@@ -33,7 +71,7 @@ class Config(object):
     #   2) Swap the stock box dimensions in the CAM setup (X=long, Y=short)
     # This makes the exported G-code cancel the downstream X/Y swap so the
     # cut runs the long direction along your physical long axis.
-    MASLOW_SWAP_XY_COMPENSATION = True
+    MASLOW_SWAP_XY_COMPENSATION = False
 
     # When True, rotate the sheet component bodies +90° about Z in addition to
     # any WCS rotation. This used to be the hard-coded behavior; it can be
@@ -44,7 +82,7 @@ class Config(object):
     # Developer-only guard: when True, raise a RuntimeError immediately before
     # applying any sheet-body rotation so a stack trace can be captured during
     # debugging. Default is False.
-    DEBUG_FAIL_ON_ROTATION = True
+    DEBUG_FAIL_ON_ROTATION = False
 
     # ---- Optional concave/U-shape pairing (experimental) ----
     ENABLE_U_PAIRING = True

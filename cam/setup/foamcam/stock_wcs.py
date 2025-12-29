@@ -115,20 +115,24 @@ class StockWcsEnforcer:
                 self.logger.log(f"WCS axis param set {used}={expr}")
         return swapped_any
 
-    def enforce(self, setup, model_bodies) -> dict:
+    def enforce(self, setup, model_bodies, force_wcs_rotation: bool = None, force_swap_xy: bool = None) -> dict:
         """
         Core rule:
           - Maslow +Y moves away from you
           - Fusion +Y MUST be the long sheet direction
           - If model long axis is X, rotate WCS 90° so toolpaths align
         Also ensures stock >= model and only then sets origin top-center.
+        
+        Parameters:
+          force_wcs_rotation: override auto WCS rotation (None = auto-decide based on model)
+          force_swap_xy: override MASLOW_SWAP_XY_COMPENSATION (None = use Config)
         """
         ex = model_xy_extents_mm(model_bodies)
         if not ex:
             raise RuntimeError("Could not compute model extents (no bodies?).")
         model_x, model_y = ex
         model_long_is_x = (model_x >= model_y)
-        compensate_xy = bool(getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', False))
+        compensate_xy = force_swap_xy if force_swap_xy is not None else bool(getattr(self.Config, 'MASLOW_SWAP_XY_COMPENSATION', False))
 
         margin_mm = self.units.eval_mm(self.Config.LAYOUT_MARGIN)
         stock_thk_mm = self.units.eval_mm(self.Config.SHEET_THK)
@@ -151,7 +155,12 @@ class StockWcsEnforcer:
         # We keep the stock box dimensions in Fusion's native X/Y (stockX=min,
         # stockY=max), and rely on the forced WCS rotation to make the toolpath
         # align with the physical long axis.
-        rotate_wcs_90 = bool(model_long_is_x) or bool(compensate_xy)
+        # If force_wcs_rotation is provided, use it; else auto-decide.
+        if force_wcs_rotation is not None:
+            rotate_wcs_90 = bool(force_wcs_rotation)
+            self.logger.log(f"WCS rotation forced by caller: {rotate_wcs_90}")
+        else:
+            rotate_wcs_90 = bool(model_long_is_x) or bool(compensate_xy)
 
         # Always set the stock box in Fusion's native axes.
         set_stock_x = stockX
