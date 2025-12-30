@@ -19,6 +19,8 @@ class SheetNester:
 
         self.margin = self.units.eval_mm(Config.LAYOUT_MARGIN)
         self.gap = self.units.eval_mm(Config.LAYOUT_GAP)
+        self.min_spacing = self.units.eval_mm(getattr(Config, 'MIN_PART_SPACING', Config.LAYOUT_GAP))
+        self.spacing = max(self.gap, self.min_spacing)
 
     def _ensure_occurrence(self, comp_name: str) -> adsk.fusion.Occurrence:
         try:
@@ -338,7 +340,7 @@ class SheetNester:
                         # new row
                         if x > 0.0 and (x + w) > usable_w:
                             x = 0.0
-                            y += row_h + self.gap
+                            y += row_h + self.spacing
                             row_h = 0.0
 
                         # no vertical space
@@ -367,7 +369,7 @@ class SheetNester:
                             except: pass
                             continue
 
-                        x += w + self.gap
+                        x += w + self.spacing
                         row_h = max(row_h, h)
                         placed_any = True
                         placed_this = True

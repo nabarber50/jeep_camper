@@ -1,6 +1,7 @@
 # cam/setup/foamcam/cam_ops.py
 import adsk.core, adsk.cam, adsk.fusion
 import math
+from typing import List
 from foamcam.models import CamBuildResult
 from foamcam.geometry import model_xy_extents_mm
 
@@ -158,40 +159,202 @@ class CamBuilder:
             self.logger.log(f'ROTATION DECISION: sheet={name} rotated=False reason=EXCEPTION error={e}')
             return False
 
-    def _find_tool_best_effort(self):
-        name_key = (self.Config.PREFERRED_TOOL_NAME_CONTAINS or '').lower()
-
-        def scan_tools(tools):
-            try:
-                for i in range(tools.count):
-                    t = tools.item(i)
-                    try:
-                        if name_key and name_key in (t.name or '').lower():
-                            return t
-                    except:
-                        pass
-            except:
-                pass
+    def _find_tool_by_name(self, name_substring: str, library_url: str = None):
+        """Search tool library for a tool whose description/name contains the given substring.
+        
+        Uses official Autodesk API pattern: CAMManager.get() -> libraryManager -> toolLibraries
+        """
+        if not name_substring:
+            self.logger.log("Tool search: no name substring provided")
             return None
-
+        
+        search_key = name_substring.lower()
+        self.logger.log(f"Tool search: looking for '{search_key}'")
+        
         try:
-            app = adsk.core.Application.get()
-            cam_mgr = getattr(app, "camManager", None)
-            if cam_mgr:
-                lm = getattr(cam_mgr, "libraryManager", None)
-                if lm:
-                    libs = getattr(lm, "toolLibraries", None)
-                    if libs:
-                        for li in range(libs.count):
-                            lib = libs.item(li)
-                            tools = getattr(lib, "tools", None)
-                            if tools:
-                                t = scan_tools(tools)
-                                if t:
-                                    return t
-        except:
-            pass
-        return None
+            # Official pattern from Autodesk sample code
+            camManager = adsk.cam.CAMManager.get()
+            if not camManager:
+                self.logger.log("Tool search: CAMManager.get() returned None")
+                return None
+            
+            libraryManager = camManager.libraryManager
+            if not libraryManager:
+                self.logger.log("Tool search: libraryManager is None")
+                return None
+            
+            toolLibraries = libraryManager.toolLibraries
+            if not toolLibraries:
+                self.logger.log("Tool search: toolLibraries is None")
+                return None
+            
+            # If specific library URL provided, load and search it
+            if library_url:
+                try:
+                    url = adsk.core.URL.create(library_url)
+                    lib = toolLibraries.toolLibraryAtURL(url)
+                    if lib:
+                        lib_name = getattr(lib, 'name', library_url)
+                        self.logger.log(f"  Loaded library: {lib_name}")
+                        tools = getattr(lib, "tools", None)
+                        if tools:
+                            for ti in range(tools.count):
+                                try:
+                                    tool = tools.item(ti)
+                                    desc = getattr(tool, "description", "")
+                                    name = getattr(tool, "name", "")
+                                    if search_key in desc.lower() or search_key in name.lower():
+                                        self.logger.log(f"Tool search: Found '{desc or name}'")
+                                        return tool
+                                except Exception as e:
+                                    if ti < 3:
+                                        self.logger.log(f"    Tool[{ti}]: error - {e}")
+                except Exception as e:
+                    self.logger.log(f"  Failed to load library '{library_url}': {e}")
+                    return None  # Stop here if specific library search fails
+            
+            # If no library URL or not found in specified library, we can't search all
+            # because toolLibraries doesn't support iteration in script context
+            self.logger.log(f"Tool search: no match for '{search_key}' in library")
+            return None
+        
+        except Exception as e:
+            self.logger.log(f"Tool search: exception - {e}")
+            return None
+    
+    def _find_tool_best_effort(self):
+        """Find tool using config-specified name or diameter.
+        
+        Uses official Autodesk CAM API patterns for tool library access.
+        """
+        try:
+            library_url = getattr(self.Config, 'TOOL_LIBRARY_URL', None)
+            if not library_url:
+                self.logger.log("Tool auto-pick: no TOOL_LIBRARY_URL in config")
+                return None
+            
+            # Try name search first if configured
+            name_search = getattr(self.Config, 'TOOL_NAME_SEARCH', None)
+            if name_search:
+                self.logger.log(f"Tool auto-pick: searching by name '{name_search}'")
+                tool = self._find_tool_by_name(name_search, library_url)
+                if tool:
+                    return tool
+            
+            # Fall back to query by criteria
+            tool_type = getattr(self.Config, 'TOOL_TYPE', 'flat end mill')
+            min_diam = getattr(self.Config, 'TOOL_DIAMETER_MIN', 0.3)
+            max_diam = getattr(self.Config, 'TOOL_DIAMETER_MAX', 0.6)
+            min_flute = getattr(self.Config, 'TOOL_MIN_FLUTE_LENGTH', None)
+            
+            self.logger.log(f"Tool auto-pick: query by criteria")
+            return self._find_tool_by_query(library_url, tool_type, min_diam, max_diam, min_flute)
+            
+        except Exception as e:
+            self.logger.log(f"Tool auto-pick: exception - {e}")
+            return None
+    
+    def _find_tool_by_query(self, library_url: str, tool_type: str, min_diameter: float, max_diameter: float, min_flute_length: float = None):
+        """Find tool using query criteria (diameter, type, flute length).
+        
+        Uses official Autodesk API pattern from sample code with ToolQuery.
+        Parameters in cm (Fusion internal units).
+        """
+        try:
+            camManager = adsk.cam.CAMManager.get()
+            if not camManager:
+                self.logger.log("Tool query: CAMManager.get() returned None")
+                return None
+            
+            libraryManager = camManager.libraryManager
+            if not libraryManager:
+                self.logger.log("Tool query: libraryManager is None")
+                return None
+            
+            toolLibraries = libraryManager.toolLibraries
+            if not toolLibraries:
+                self.logger.log("Tool query: toolLibraries is None")
+                return None
+            
+            # Load the specified library by URL
+            try:
+                url = adsk.core.URL.create(library_url)
+                toolLibrary = toolLibraries.toolLibraryAtURL(url)
+            except Exception as e:
+                self.logger.log(f"Tool query: Failed to load library '{library_url}': {e}")
+                return None
+            
+            if not toolLibrary:
+                self.logger.log(f"Tool query: toolLibrary is None for '{library_url}'")
+                return None
+            
+            try:
+                lib_name = toolLibrary.name
+            except:
+                lib_name = library_url
+            self.logger.log(f"Tool query: Loaded library '{lib_name}'")
+            
+            # Create query with criteria (official pattern from Autodesk sample)
+            try:
+                query = toolLibrary.createQuery()
+            except Exception as e:
+                self.logger.log(f"Tool query: createQuery() failed: {e}")
+                return None
+            
+            # Add criteria using ValueInput objects (official pattern)
+            try:
+                query.criteria.add('tool_type', adsk.core.ValueInput.createByString(tool_type))
+                query.criteria.add('tool_diameter.min', adsk.core.ValueInput.createByReal(min_diameter))
+                query.criteria.add('tool_diameter.max', adsk.core.ValueInput.createByReal(max_diameter))
+                
+                if min_flute_length is not None:
+                    query.criteria.add('tool_fluteLength.min', adsk.core.ValueInput.createByReal(min_flute_length))
+            except Exception as e:
+                self.logger.log(f"Tool query: Failed to set criteria: {e}")
+                return None
+            
+            criteria_str = f"type='{tool_type}' diameter={min_diameter:.2f}-{max_diameter:.2f}cm"
+            if min_flute_length:
+                criteria_str += f" flute_length>={min_flute_length:.2f}cm"
+            self.logger.log(f"  Criteria: {criteria_str}")
+            
+            # Execute query and extract tools from results (per official pattern)
+            try:
+                results = query.execute()
+            except Exception as e:
+                self.logger.log(f"Tool query: execute() failed: {e}")
+                return None
+            
+            if not results:
+                self.logger.log(f"Tool query: execute() returned None")
+                return None
+            
+            # results is a list of objects with .tool property
+            tools_found = []
+            for result in results:
+                try:
+                    tool = result.tool
+                    tools_found.append(tool)
+                except Exception as e:
+                    self.logger.log(f"  Warning: Could not extract tool from result: {e}")
+            
+            if tools_found:
+                tool = tools_found[0]
+                try:
+                    tool_desc = tool.description
+                except:
+                    tool_desc = "(unknown)"
+                self.logger.log(f"  Success: Found '{tool_desc}' ({len(tools_found)} total matches)")
+                return tool
+            else:
+                self.logger.log(f"  No tools matched the query criteria")
+                return None
+                
+        except Exception as e:
+            self.logger.log(f"Tool query: Unexpected exception - {e}")
+            import traceback
+            self.logger.log(f"  Traceback: {traceback.format_exc()}")
+            return None
 
     def _set_expr(self, params, name, expr):
         try:
@@ -242,6 +405,76 @@ class CamBuilder:
         except:
             pass
 
+    def _auto_select_contours_on_operation(
+        self,
+        operation: 'adsk.cam.Operation',
+        model_bodies: List['adsk.fusion.BRepBody']
+    ) -> None:
+        """Select contours for 2D Profile operation after it's been added to setup."""
+        try:
+            self.logger.log(f"  Contour selection: checking parameters on added operation...")
+            params = operation.parameters
+            
+            # List available parameters for debugging
+            param_names = []
+            for i in range(params.count):
+                param = params.item(i)
+                param_names.append(param.name)
+            self.logger.log(f"    Available params on added op: {', '.join(param_names[:20])}")
+            
+            # Try to find the contours parameter
+            contours_param_name = None
+            for name in ['contours', 'machiningBoundarySel', 'geometry', 'silhouette']:
+                if params.itemByName(name):
+                    contours_param_name = name
+                    self.logger.log(f"    Found contours parameter: '{name}'")
+                    break
+            
+            if not contours_param_name:
+                self.logger.log(f"  WARNING: No contours parameter found")
+                return
+                
+            cadcontours2d_param = params.itemByName(contours_param_name).value
+            if not cadcontours2d_param:
+                self.logger.log(f"  Contour parameter '{contours_param_name}' has no value")
+                return
+
+            chains = cadcontours2d_param.getCurveSelections()
+            if chains is None:
+                self.logger.log(f"  getCurveSelections() returned None")
+                return
+
+            # Try face contour selection first
+            self.logger.log(f"  Attempting face contour selection...")
+            for body in model_bodies:
+                for face in body.faces:
+                    try:
+                        chain = chains.createNewChainSelection()
+                        chain.inputGeometry = [face]
+                        cadcontours2d_param.applyCurveSelections(chains)
+                        self.logger.log(f"    SUCCESS: Selected face contour")
+                        return
+                    except:
+                        pass
+
+            # Fallback: edge selection
+            self.logger.log(f"  Face selection failed, trying edge selection...")
+            edges = []
+            for body in model_bodies:
+                for edge in body.edges:
+                    edges.append(edge)
+
+            if edges:
+                chain = chains.createNewChainSelection()
+                chain.inputGeometry = edges
+                cadcontours2d_param.applyCurveSelections(chains)
+                self.logger.log(f"    Edge selection applied ({len(edges)} edges)")
+            else:
+                self.logger.log(f"  WARNING: No edges found in model")
+
+        except Exception as e:
+            self.logger.log(f"  Contour selection error: {str(e)}")
+
     def _create_2d_contour_input_best_effort(self, ops, ui, warn_state: dict):
         candidates = [
             '2dContour','2DContour','contour2d','contour2D','Contour2D','2d-contour','2d_contour','2dContourOp',
@@ -278,13 +511,20 @@ class CamBuilder:
         warn_state = {"warned": False}
         tool = None
 
+        self.logger.log("=== Tool selection starting ===")
         try:
+            self.logger.log("Calling _find_tool_best_effort...")
             tool = self._find_tool_best_effort()
             if tool:
-                self.logger.log(f"Tool auto-picked: {tool.name}")
+                try:
+                    tool_desc = tool.description
+                except:
+                    tool_desc = "(unknown)"
+                self.logger.log(f"Tool auto-picked: {tool_desc}")
             else:
-                self.logger.log("Tool auto-pick unavailable; ops will be created without tool selection.")
-        except:
+                self.logger.log("Tool auto-pick returned None; ops will be created without tool selection.")
+        except Exception as e:
+            self.logger.log(f"Tool auto-pick exception: {e}")
             tool = None
 
         def try_assign_tool(op):
@@ -362,8 +602,13 @@ class CamBuilder:
 
             if prof_in:
                 prof_in.displayName = 'Foam Cutout 2D (Profile)'
+                
+                # Add operation first
                 prof = ops.add(prof_in)
                 try_assign_tool(prof)
+                
+                # Auto-select contours from model bodies (on ADDED operation, not input)
+                self._auto_select_contours_on_operation(prof, model_bodies)
 
                 self._set_bool(prof.parameters, 'doRoughingPasses', True)
                 self._set_bool(prof.parameters, 'doMultipleDepths', True)
@@ -375,6 +620,11 @@ class CamBuilder:
             try:
                 rough_in = ops.createInput('adaptive')
                 rough_in.displayName = 'Foam Rough 3D (Adaptive)'
+                # Explicitly set model geometry to setup models
+                try:
+                    rough_in.models = setup.models
+                except:
+                    pass
                 rough = ops.add(rough_in)
                 try_assign_tool(rough)
 
@@ -387,6 +637,11 @@ class CamBuilder:
             try:
                 fin_in = ops.createInput('scallop')
                 fin_in.displayName = 'Foam Finish 3D (Scallop)'
+                # Explicitly set model geometry to setup models
+                try:
+                    fin_in.models = setup.models
+                except:
+                    pass
                 fin = ops.add(fin_in)
                 try_assign_tool(fin)
 

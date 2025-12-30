@@ -7,6 +7,7 @@
 import sys
 import os
 import traceback
+import importlib
 import adsk.core, adsk.fusion, adsk.cam
 
 # folder containing this entry script
@@ -18,6 +19,14 @@ _repo_root = _here  # adjust if needed (see note below)
 
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
+
+# Force reload of foamcam modules to pick up code changes (bypass __pycache__)
+_foamcam_modules = [m for m in list(sys.modules.keys()) if m.startswith('foamcam')]
+for mod_name in _foamcam_modules:
+    try:
+        del sys.modules[mod_name]
+    except:
+        pass
     
 try:
     from foamcam.config import Config
@@ -27,11 +36,15 @@ try:
     from foamcam.nesting import SheetNester
     from foamcam.cam_ops import CamBuilder
     from foamcam.stock_wcs import StockWcsEnforcer
-    from foamcam.helpers import get_cam_product
+    from foamcam.helpers import get_cam_product, post_process_setup
 
 except Exception as e:
+    import traceback
     with open(os.path.join(os.path.expanduser("~"), "fusion_foamcam_panic.log"), "a", encoding="utf-8") as f:
-        f.write(str(e))
+        f.write("IMPORT ERROR:\n")
+        f.write(traceback.format_exc())
+        f.write("\n\n")
+    raise  # Re-raise to stop execution
 
 def run(context):
     """Main entrypoint for Foam CAM template."""
@@ -122,20 +135,95 @@ def run(context):
 
         _logger.log("Creating CAM setups/ops for sheets...")
 
+        # Create progress dialog for CAM creation
+        progressDialog = ui.createProgressDialog()
+        progressDialog.isCancelButtonShown = False
+        progressDialog.show('Creating CAM setups...', '%p%', 0, 100)
+        adsk.doEvents()
+
         # Enforcer: ensures stock dims + tries to enforce WCS params (best effort)
         enforcer = StockWcsEnforcer(design, units, _logger, Config)
 
         builder = CamBuilder(cam, design, units, _logger, Config, enforcer=enforcer)
 
+        # Update progress to 50% at start
+        progressDialog.progressValue = 50
+        adsk.doEvents()
+
         result = builder.create_for_sheets(sheets, ui)
 
+        # Update progress to 90% after CAM creation
+        progressDialog.progressValue = 90
+        adsk.doEvents()
+
         _logger.log("CAM creation complete.")
-        ui.messageBox(
+        
+        # Post-processing (if enabled)
+        nc_files = []
+        if getattr(Config, 'AUTO_POST_PROCESS', False):
+            _logger.log("Auto post-processing enabled, generating NC files...")
+            _logger.log(f"  Total setups in CAM: {cam.setups.count}")
+            
+            # Update progress for post-processing phase
+            progressDialog.progressValue = 95
+            progressDialog.show('Generating NC files...', '%p%', 0, 100)
+            adsk.doEvents()
+            
+            total_setups = sum(1 for setup in cam.setups if setup.name.startswith('CAM_SHEET_'))
+            completed_setups = 0
+            
+            for setup in cam.setups:
+                try:
+                    _logger.log(f"  Checking setup: '{setup.name}'")
+                    # Post-process all setups (they start with CAM_SHEET_ from layout)
+                    if setup.name.startswith('CAM_SHEET_'):
+                        _logger.log(f"    Post-processing setup: {setup.name}")
+                        nc_path = post_process_setup(cam, setup, Config, _logger)
+                        if nc_path:
+                            nc_files.append(nc_path)
+                            _logger.log(f"    Generated: {nc_path}")
+                        else:
+                            _logger.log(f"    Failed to generate NC file for {setup.name}")
+                        
+                        # Update progress bar for post-processing
+                        completed_setups += 1
+                        if total_setups > 0:
+                            progress = 95 + int(5 * completed_setups / total_setups)
+                            progressDialog.progressValue = progress
+                            adsk.doEvents()
+                    else:
+                        _logger.log(f"    Skipping (name doesn't start with CAM_SHEET_)")
+                except Exception as e:
+                    _logger.log(f"  Post-process error for {setup.name}: {e}")
+            
+            # Set progress to 100% when done
+            progressDialog.progressValue = 100
+            adsk.doEvents()
+            progressDialog.hide()
+            
+            if nc_files:
+                _logger.log(f"Post-processing complete: {len(nc_files)} NC files generated")
+            else:
+                _logger.log("Post-processing: no NC files generated")
+        else:
+            _logger.log("AUTO_POST_PROCESS disabled, skipping NC generation")
+            progressDialog.progressValue = 100
+            adsk.doEvents()
+            progressDialog.hide()
+        
+        # Build completion message
+        completion_msg = (
             "Done.\n\n"
             f"Sheets: {len(sheets)}\n"
             f"Setups created: {result.setups_created}\n"
             f"Orientation enforcement failures: {result.enforcement_failures}\n"
         )
+        
+        if nc_files:
+            completion_msg += f"\nNC files generated: {len(nc_files)}\n"
+            completion_msg += "Output folder: " + str(getattr(Config, 'NC_OUTPUT_FOLDER', None) or Config.get_desktop_path())
+        
+        ui.messageBox(completion_msg)
         _logger.log("=== RUN SUCCESS ===")
 
     except Exception:
