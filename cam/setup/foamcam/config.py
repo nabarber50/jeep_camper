@@ -58,6 +58,73 @@ class Config(object):
         ("EXT_4x12", 1219.2, 3657.6),
         ("WIDE_6x10", 1828.8, 3048.0),
     ]
+    
+    # ---- Packing Optimization ----
+    # Packing strategy: 'shelf' (fast, simple rows) or 'smart' (better density, slower)
+    # 'shelf': Left-to-right rows, largest parts first (current default)
+    # 'smart': Multi-pass with best-fit positioning and gap filling
+    PACKING_STRATEGY = 'smart'  # 'shelf' or 'smart'
+    
+    # CRITICAL: Allow mixed packing of small + large parts on same sheets
+    # When True: Small parts (void_candidates) are packed on the same sheets as large parts
+    #            This dramatically reduces sheet count by filling gaps
+    # When False: Small parts are relegated to separate "fallback" sheets (less efficient)
+    # RECOMMENDED: Keep True for maximum material efficiency
+    PACKING_MIXED_SMALL_LARGE = True  # Pack small parts alongside large parts on same sheets
+    
+    # When using 'smart' strategy, enable gap filling with smaller parts
+    PACKING_SMART_GAP_FILL = True  # Try to fit smaller items into remaining spaces
+    
+    # Maximum packing passes to attempt per sheet (smart mode only)
+    PACKING_MAX_PASSES = 2  # 1=single pass, 2+=multi-pass for better density
+    
+    # Log packing efficiency statistics
+    PACKING_LOG_EFFICIENCY = True  # Report material utilization per sheet
+    
+    # ---- Void Nesting (Advanced) ----
+    # Enable nesting smaller parts inside internal voids/holes of larger parts
+    # Example: Small rectangles can nest inside the cutout of a large frame
+    # Parts are now sorted by size globally to ensure large parts with voids are placed first
+    ENABLE_VOID_NESTING = True  # Try nesting small parts in detected voids
+    VOID_NESTING_MIN_SIZE = 30.0  # mm - minimum void size to consider for nesting
+    VOID_NESTING_MARGIN = 2.0  # mm - clearance margin around nested parts (tighter to fit pockets)
+    VOID_NESTING_ALLOW_CROSS_SHEETS = True  # Allow filling voids on already-created sheets from later parts/classes
+    ENABLE_BACKFILL_VOID_PASS = False  # Second-pass void backfill (can be heavy); fallback sheets will be used instead
+    # ⚠️  BACKFILL KNOWN ISSUE: Backfill void pass causes hang/crash during iteration.
+    # Root cause: Likely infinite loop, Fusion API call exception, or memory issue in backfill loop.
+    # Workaround: Disabled by default. Fallback placement (normal shelf packing on extra sheets) is stable.
+    # Parts at or below these limits will be deferred to a dedicated void-fill phase before creating new sheets
+    VOID_CANDIDATE_MAX_DIM_MM = 300.0
+    VOID_CANDIDATE_MAX_AREA_MM2 = 250000.0
+    
+    # Packing groups: Force certain parts to be packed together on the same sheet
+    # This enables void nesting between parts that have parent-child relationships
+    # Format: list of tuples, each tuple contains part names that should stay together
+    # Example: PACKING_GROUPS = [("Layer_15_part_01", "Layer_17_part_03")]
+    # This forces L17_P03 to pack on same sheet as L15_P01 for void nesting optimization
+    # To nest all small parts from layers 3-13 into the void of Layer_15_part_01:
+    PACKING_GROUPS = [
+        # Anchor part first, then only the big companions that must share its sheet
+        # Keep small parts free to choose STD_4x8 where possible, reducing 6x10 usage
+        ("Layer_15_part_01",   # Large anchor with void
+         "Layer_17_part_03",   # 588×1325mm part (void carrier)
+         "Layer_03_part_01",   # ~1002x1466
+         "Layer_13_part_04"),  # ~976x1415
+    ]
+
+    # Hard-fail if any part cannot be placed; set to False to allow partial layouts
+    FAIL_ON_UNPLACED_PARTS = True
+
+    # When True, allow packing-group members to spill onto later sheets of the same class
+    # after the anchor sheet has been processed. This prevents hard deadlocks when the
+    # anchor sheet runs out of space but some grouped parts remain.
+    PACKING_GROUP_ALLOW_SPILLOVER = True
+
+    # Optional safety: do NOT force a group member to the anchor's sheet class if it exceeds
+    # these size limits. This lets very large parts keep their own best-fitting class and
+    # avoids inflating sheet count when anchors are on larger stock. Set to None to disable.
+    PACKING_GROUP_FORCE_MAX_DIM_MM   = 1200.0  # skip forcing if either dimension exceeds this (None = disable cap)
+    PACKING_GROUP_FORCE_MAX_AREA_MM2 = None    # or skip forcing if area exceeds this
 
     # ---- Axis mapping compensation (Maslow vs Fusion) ----
     # Symptom: Fusion setup/stock looks correct, but on the Maslow the job
@@ -107,7 +174,7 @@ class Config(object):
     POST_PROCESSOR_VENDOR = 'Autodesk'  # Filter by vendor
     
     # Output settings
-    NC_OUTPUT_FOLDER = r"c:\Users\nabar\OneDrive\Desktop\fusion_nc"  # None = Desktop, or provide absolute path
+    NC_OUTPUT_FOLDER = os.path.join(get_desktop_path(), "fusion_nc")  # NC files output folder
     NC_OPEN_IN_EDITOR = False  # Open generated NC files in editor
     NC_FILE_PREFIX = 'FoamCAM_'  # Prefix for generated NC filenames
     
@@ -115,6 +182,16 @@ class Config(object):
     POST_TOLERANCE = 0.004  # Built-in tolerance for post processor
     POST_SHOW_SEQUENCE_NUMBERS = False  # Include N-numbers in output
     POST_PROGRAM_COMMENT = 'Generated by FoamCAM'  # Header comment
+    
+    # Part identification in NC files
+    NC_ADD_PART_LABELS = True  # Add comments identifying each part being cut
+    NC_LABEL_FORMAT = '; Part: {name} ({width:.1f}x{height:.1f}mm)'  # Comment format for part labels
+    
+    # Tiny parts detection and warnings
+    WARN_TINY_PARTS = True  # Log warnings for parts below minimum size threshold
+    MIN_PART_WIDTH_MM = 25.0  # Minimum width in mm (parts smaller may be difficult to cut)
+    MIN_PART_HEIGHT_MM = 25.0  # Minimum height in mm (parts smaller may be difficult to cut)
+    SKIP_TINY_PARTS = False  # If True, exclude tiny parts from layout entirely (default: warn only)
 
     # Developer-only guard: when True, raise a RuntimeError immediately before
     # applying any sheet-body rotation so a stack trace can be captured during

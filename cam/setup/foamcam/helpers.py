@@ -1,6 +1,197 @@
 import adsk.core
 import adsk.cam
 import os
+import re
+
+
+def add_part_labels_to_nc_file(nc_file_path, setup, config, logger):
+    """Add part identification comments to NC file.
+    
+    Injects comments before each toolpath to identify which part is being cut.
+    This makes it easier to track progress during machining.
+    
+    Args:
+        nc_file_path: Path to generated NC file
+        setup: CAM setup object (to get part names from component)
+        config: Config object
+        logger: Logger instance
+    
+    Returns:
+        True if labels were added successfully, False otherwise
+    """
+    if not getattr(config, 'NC_ADD_PART_LABELS', False):
+        return True  # Feature disabled, no error
+    
+    try:
+        # Read the NC file
+        with open(nc_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+        
+        part_info = []
+        
+        # Import registry to get part names with dimensions
+        try:
+            from foamcam.sheet_registry import get_sheet_parts
+            registry_parts = get_sheet_parts(setup.name)
+            if registry_parts:
+                logger.log(f"  Part labels: using registered {len(registry_parts)} part info from sheet registry")
+                # Convert registry format to part_info format
+                for entry in registry_parts:
+                    part_info.append({
+                        'name': entry.get('name', ''),
+                        'width': entry.get('width', 0),
+                        'height': entry.get('height', 0),
+                        'depth': 0
+                    })
+        except Exception as e:
+            logger.log(f"  Part labels: could not load from registry: {e}")
+        
+        # Log what we collected
+        try:
+            logger.log(f"  Part labels: collected {len(part_info)} bodies for labeling")
+            if part_info:
+                preview = ', '.join([pi['name'] for pi in part_info[:5]])
+                logger.log(f"  Part labels: sample parts: {preview} ...")
+        except Exception:
+            pass
+        
+        # Fallback: extract from setup if registry is empty
+        if not part_info:
+            logger.log(f"  Part labels: registry empty, falling back to setup extraction")
+            
+            def _add_body_info(body, label: str = None):
+                """Extract part info from a body."""
+                try:
+                    if not body:
+                        return
+                    actual_label = label or getattr(body, 'name', '(unnamed)')
+                    bbox = body.boundingBox
+                    width_mm = abs((bbox.maxPoint.x - bbox.minPoint.x) * 10)  # cm to mm
+                    height_mm = abs((bbox.maxPoint.y - bbox.minPoint.y) * 10)
+                    depth_mm = abs((bbox.maxPoint.z - bbox.minPoint.z) * 10)
+                    part_info.append({
+                        'name': actual_label,
+                        'width': width_mm,
+                        'height': height_mm,
+                        'depth': depth_mm
+                    })
+                except Exception as e:
+                    logger.log(f"  Part labels: error processing body '{label}': {e}")
+
+            # Try to get bodies from sheet occurrence
+            bodies_collected = False
+            try:
+                sheet_name = setup.name.replace('CAM_', '')
+                if hasattr(setup, 'document') and setup.document:
+                    design = setup.document.design
+                    if design and hasattr(design, 'rootComponent'):
+                        root = design.rootComponent
+                        for occ in root.occurrences:
+                            if occ.component and occ.component.name == sheet_name:
+                                comp = occ.component
+                                if hasattr(comp, 'bRepBodies') and comp.bRepBodies.count > 0:
+                                    logger.log(f"  Part labels: collecting {comp.bRepBodies.count} bodies from sheet '{sheet_name}'")
+                                    for i in range(comp.bRepBodies.count):
+                                        b = comp.bRepBodies.item(i)
+                                        _add_body_info(b, getattr(b, 'name', None))
+                                    bodies_collected = True
+                                break
+            except Exception as e:
+                logger.log(f"  Part labels: could not extract from sheet occurrence: {e}")
+
+            # Fallback: try setup.component
+            if not bodies_collected:
+                try:
+                    if hasattr(setup, 'component') and setup.component:
+                        comp = setup.component
+                        if hasattr(comp, 'bRepBodies') and comp.bRepBodies.count > 0:
+                            logger.log(f"  Part labels: collecting {comp.bRepBodies.count} bodies from setup component")
+                            for i in range(comp.bRepBodies.count):
+                                b = comp.bRepBodies.item(i)
+                                _add_body_info(b, getattr(b, 'name', None))
+                            bodies_collected = True
+                except Exception as e:
+                    logger.log(f"  Part labels: could not extract from setup.component: {e}")
+
+            # Fallback 2: try setup.models
+            if not bodies_collected:
+                try:
+                    models = None
+                    if hasattr(setup, 'models') and setup.models and setup.models.count > 0:
+                        models = setup.models
+                    elif hasattr(setup, 'model') and setup.model:
+                        models = [setup.model]
+
+                    if models:
+                        try:
+                            mcount = models.count if hasattr(models, 'count') else len(models)
+                        except:
+                            mcount = '?'
+                        logger.log(f"  Part labels: inspecting {mcount} model entries")
+
+                        if hasattr(models, 'count'):
+                            for i in range(models.count):
+                                item = models.item(i)
+                                if hasattr(item, 'bRepBodies') and item.bRepBodies.count > 0:
+                                    for b in item.bRepBodies:
+                                        _add_body_info(b, getattr(b, 'name', getattr(item, 'name', None)))
+                                elif hasattr(item, 'name'):
+                                    _add_body_info(item, getattr(item, 'name', None))
+                        else:
+                            for item in models:
+                                if hasattr(item, 'bRepBodies') and item.bRepBodies.count > 0:
+                                    for b in item.bRepBodies:
+                                        _add_body_info(b, getattr(b, 'name', getattr(item, 'name', None)))
+                                elif hasattr(item, 'name'):
+                                    _add_body_info(item, getattr(item, 'name', None))
+                        bodies_collected = True
+                except Exception as e:
+                    logger.log(f"  Part labels: exception in part extraction: {e}")
+        
+        if not part_info:
+            logger.log(f"  Part labels: no parts found, skipping")
+            return True
+        
+        # Find operation boundaries (look for G0 rapid moves which typically start new features)
+        # Insert part labels before these moves
+        label_format = getattr(config, 'NC_LABEL_FORMAT', '; Part: {name} ({width:.1f}x{height:.1f}mm)')
+        modified_lines = []
+        part_index = 0
+        last_was_label = False
+        
+        rapid_re = re.compile(r'^\s*(N\d+\s+)?(G0|G00|T\d+)', re.IGNORECASE)
+
+        for i, line in enumerate(lines):
+            # Look for rapid positioning moves or tool changes (with optional N numbers)
+            if rapid_re.match(line) and not last_was_label:
+                # Add part label before this line
+                if part_index < len(part_info):
+                    part = part_info[part_index]
+                    label = label_format.format(
+                        name=part['name'],
+                        width=part['width'],
+                        height=part['height']
+                    )
+                    modified_lines.append(label + '\n')
+                    part_index += 1
+                    last_was_label = True
+            else:
+                last_was_label = False
+            
+            modified_lines.append(line)
+        
+        # Write modified file back
+        with open(nc_file_path, 'w', encoding='utf-8') as f:
+            f.writelines(modified_lines)
+        
+        if part_index == 0 and part_info:
+            logger.log("  Part labels: no insertion points matched; consider relaxing regex")
+        logger.log(f"  Part labels: added {part_index} part identification comments")
+        return True
+        
+    except Exception as e:
+        logger.log(f"  Part labels: failed to add labels: {e}")
+        return False
 
 
 def create_cam_selection_set(cam, bodies, set_name, logger):
@@ -340,7 +531,7 @@ def post_process_setup(cam, setup, config, logger):
         logger.log(f"Post-process: starting for setup '{setup.name}' ({setup.operations.count} operations)")
         
         # Optional testing mode: only process first sheet
-        if Config.GENERATE_NC_ONESHOT and not setup.name.endswith('_01_STD_4x8'):
+        if config.GENERATE_NC_ONESHOT and not setup.name.endswith('_01_STD_4x8'):
             logger.log(f"  Skipping (GENERATE_NC_ONESHOT=True, testing first sheet only)")
             return None
         
@@ -350,7 +541,7 @@ def post_process_setup(cam, setup, config, logger):
             operations_to_generate = adsk.core.ObjectCollection.create()
             for op in setup.operations:
                 # Optional testing mode: only generate 2D Profile operations
-                if Config.GENERATE_NC_ONESHOT:
+                if config.GENERATE_NC_ONESHOT:
                     op_name = op.name if hasattr(op, 'name') else str(op)
                     if 'Profile' in op_name or '2D' in op_name:
                         operations_to_generate.add(op)
@@ -425,6 +616,10 @@ def post_process_setup(cam, setup, config, logger):
         if os.path.exists(output_path):
             file_size = os.path.getsize(output_path)
             logger.log(f"Post-process SUCCESS: {output_path} ({file_size} bytes)")
+            
+            # Add part identification labels if enabled
+            add_part_labels_to_nc_file(output_path, setup, config, logger)
+            
             return output_path
         else:
             logger.log(f"Post-process: file was not created at {output_path}")

@@ -72,6 +72,7 @@ class SheetLayout:
     occ: Any  # adsk.fusion.Occurrence
     usable_w: float
     usable_h: float
+    part_names: List[str] = field(default_factory=list)  # Names of parts placed on this sheet
 
 
 @dataclass

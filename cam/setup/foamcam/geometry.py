@@ -108,3 +108,75 @@ def move_translate_only(comp: adsk.fusion.Component, body: adsk.fusion.BRepBody,
     xform.translation = adsk.core.Vector3D.create(dx, dy, dz)
     inp = mv_feats.createInput(objs, xform)
     mv_feats.add(inp)
+
+
+def detect_internal_voids(body: adsk.fusion.BRepBody):
+    """Detect internal voids (holes/cutouts) in a body by analyzing face loops.
+    
+    Returns:
+        List of void info dicts: [{'bbox_mm': (x0,y0,x1,y1), 'area_mm2': float}, ...]
+    """
+    voids = []
+    try:
+        # Look at top face (typically Z-max face for flat parts)
+        top_face = None
+        max_z = -1e99
+        
+        for face in body.faces:
+            try:
+                bbox = face.boundingBox
+                face_z = (bbox.minPoint.z + bbox.maxPoint.z) * 0.5 * CM_TO_MM
+                if face_z > max_z:
+                    max_z = face_z
+                    top_face = face
+            except:
+                continue
+        
+        if not top_face:
+            return voids
+        
+        # Check for inner loops (holes/voids)
+        for loop in top_face.loops:
+            if not loop.isOuter:  # Inner loop = void
+                try:
+                    # Get bounding box of the void loop
+                    min_x = min_y = 1e99
+                    max_x = max_y = -1e99
+                    
+                    for edge in loop.edges:
+                        edge_bbox = edge.boundingBox
+                        min_x = min(min_x, edge_bbox.minPoint.x * CM_TO_MM)
+                        min_y = min(min_y, edge_bbox.minPoint.y * CM_TO_MM)
+                        max_x = max(max_x, edge_bbox.maxPoint.x * CM_TO_MM)
+                        max_y = max(max_y, edge_bbox.maxPoint.y * CM_TO_MM)
+                    
+                    void_w = abs(max_x - min_x)
+                    void_h = abs(max_y - min_y)
+                    void_area = void_w * void_h
+                    
+                    # Only consider significant voids (larger than minimum part size)
+                    if void_w > 30.0 and void_h > 30.0:  # mm
+                        voids.append({
+                            'bbox_mm': (min_x, min_y, max_x, max_y),
+                            'width_mm': void_w,
+                            'height_mm': void_h,
+                            'area_mm2': void_area
+                        })
+                except:
+                    continue
+    except:
+        pass
+    
+    return voids
+
+
+def can_fit_in_void(part_w_mm: float, part_h_mm: float, void_info: dict, margin_mm: float = 5.0) -> bool:
+    """Check if a part can fit inside a void with clearance margin."""
+    void_w = void_info['width_mm']
+    void_h = void_info['height_mm']
+    
+    # Try both orientations
+    fits_normal = (part_w_mm + 2*margin_mm <= void_w) and (part_h_mm + 2*margin_mm <= void_h)
+    fits_rotated = (part_h_mm + 2*margin_mm <= void_w) and (part_w_mm + 2*margin_mm <= void_h)
+    
+    return fits_normal or fits_rotated

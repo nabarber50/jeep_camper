@@ -37,6 +37,7 @@ try:
     from foamcam.cam_ops import CamBuilder
     from foamcam.stock_wcs import StockWcsEnforcer
     from foamcam.helpers import get_cam_product, post_process_setup
+    from foamcam.sheet_registry import register_sheet_parts, clear_registry
 
 except Exception as e:
     import traceback
@@ -61,6 +62,10 @@ def run(context):
             f"MASLOW_ROTATE_SHEET_BODIES={getattr(Config,'MASLOW_ROTATE_SHEET_BODIES',None)} "
             f"ALLOW_ROTATE_90={getattr(Config,'ALLOW_ROTATE_90',None)}"
         )
+        
+        # Clear sheet registry at start of each run
+        clear_registry()
+        
     except Exception as e:
         with open(os.path.join(os.path.expanduser("~"), "fusion_foamcam_panic.log"), "a", encoding="utf-8") as f:
             # f.write("sys.path[0]=%s\n" % sys.path[0])
@@ -99,6 +104,11 @@ def run(context):
             nester = SheetNester(design, units, _logger, Config)
             sheets = nester.layout(bodies)
             _logger.log(f"Auto layout complete. Sheets: {len(sheets)}")
+            
+            # Register sheet parts for NC labeling
+            for sheet in sheets:
+                setup_name = f"CAM_SHEET_{sheet.index:02d}_{sheet.class_name}"
+                register_sheet_parts(setup_name, sheet.part_names)
         else:
             _logger.log("DO_AUTO_LAYOUT=False; skipping layout.")
 
