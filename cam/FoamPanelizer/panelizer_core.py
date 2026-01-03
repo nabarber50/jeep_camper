@@ -1,6 +1,49 @@
 import adsk.core, adsk.fusion, traceback, os
 
 # ------------------------------------------------------------
+# Helper: detect design mode (parametric vs direct)
+# ------------------------------------------------------------
+def _is_parametric(design: adsk.fusion.Design) -> bool:
+    """
+    Robust check for history/timeline. If timeline exists, history is on.
+    """
+    try:
+        return bool(design.timeline)
+    except:
+        return False
+
+
+def _add_temp_body_to_component(design: adsk.fusion.Design,
+                                comp: adsk.fusion.Component,
+                                temp_body: adsk.fusion.BRepBody,
+                                name: str,
+                                logger=None) -> adsk.fusion.BRepBody:
+    """
+    Insert a transient/temporary BRepBody into a component, correctly handling:
+      - Parametric (history ON): must add inside a BaseFeature edit
+      - Direct (history OFF): BaseFeatures unsupported; add directly
+    """
+    if temp_body is None:
+        raise RuntimeError("Temp body is None (boolean likely returned empty / wrong variable passed).")
+    if hasattr(temp_body, "isValid") and not temp_body.isValid:
+        raise RuntimeError("Temp body is invalid (boolean likely produced empty result).")
+
+    if _is_parametric(design):
+        # Parametric: add within BaseFeature edit
+        base_feat = comp.features.baseFeatures.add()
+        base_feat.startEdit()
+        new_body = comp.bRepBodies.add(temp_body, base_feat)
+        base_feat.finishEdit()
+    else:
+        # Direct modeling: BaseFeatures not supported
+        new_body = comp.bRepBodies.add(temp_body)
+
+    new_body.name = name
+    new_body.isVisible = True
+    return new_body
+
+
+# ------------------------------------------------------------
 # Utility: find a target occurrence by keyword (unchanged)
 # ------------------------------------------------------------
 def find_target_occurrence(root: adsk.fusion.Component, keywords):
@@ -184,6 +227,10 @@ def panelize_step_into_new_design(app,
             if ui:
                 ui.messageBox("Failed to create new Fusion design.")
             return {'ok': False}
+        
+        # Detect mode (do not force - STEP import determines final mode)
+        is_param = _is_parametric(new_design)
+        d(f"Design mode after creation: {'parametric' if is_param else 'direct'}")
 
         # camera copy (best-effort)
         try:
@@ -204,6 +251,10 @@ def panelize_step_into_new_design(app,
         import_mgr = app.importManager
         step_opts = import_mgr.createSTEPImportOptions(step_path)
         import_mgr.importToTarget(step_opts, root)
+        
+        # Detect actual mode after STEP import
+        is_param = _is_parametric(new_design)
+        d(f"Design mode after STEP import: {'parametric' if is_param else 'direct'}")
 
         # pick a component with solids
         target_comp = root
@@ -257,7 +308,10 @@ def panelize_step_into_new_design(app,
 
         d(f"classified faces: TOP={len(buckets['TOP'])} REAR={len(buckets['REAR'])} LEFT={len(buckets['LEFT'])} RIGHT={len(buckets['RIGHT'])} skipped={skipped}")
 
-        # 2) Phase A-D: Batch surface creation, stitch, thicken
+        # 2) SLAB/BOOLEAN approach: Directly intersect source with half-space planes
+        # Instead of creating box bodies, we'll use boolean operations with implicit half-spaces
+        # For now, simplify: Copy source 4 times and try union/difference operations
+        
         # Phase D: defer compute during batch operations
         try:
             root.isComputeDeferred = True
@@ -265,137 +319,129 @@ def panelize_step_into_new_design(app,
             pass
         
         temp_mgr = adsk.fusion.TemporaryBRepManager.get()
-        thickness_cm = float(capture_cm)
-        stitch_feats = target_comp.features.stitchFeatures
-        thicken_feats = target_comp.features.thickenFeatures
         base_features = target_comp.features.baseFeatures
-
+        
         created = {}
         created_count = 0
-        all_surface_bodies = []  # Track for bulk hide later
-
-        # ensure order
+        
+        # For each panel, we'll create slabs using primitive box creation in current design,
+        # then copy to temp manager for boolean operations
         order = [p.upper() for p in (panel_priority or ['TOP','LEFT','RIGHT','REAR'])]
+        
+        # Pre-calculate slab geometry
+        margin_cm = max(dx, dy, dz) * 1.5
+        slab_defs = {
+            'TOP': (
+                adsk.core.Point3D.create(min_x - margin_cm, min_y - margin_cm, (min_z + max_z) / 2),
+                (max_x + margin_cm) - (min_x - margin_cm),
+                (max_y + margin_cm) - (min_y - margin_cm),
+                (max_z + margin_cm) - ((min_z + max_z) / 2)
+            ),
+            'REAR': (
+                adsk.core.Point3D.create((min_x + max_x) / 2, min_y - margin_cm, min_z - margin_cm),
+                (max_x + margin_cm) - ((min_x + max_x) / 2),
+                (max_y + margin_cm) - (min_y - margin_cm),
+                (max_z + margin_cm) - (min_z - margin_cm)
+            ),
+            'LEFT': (
+                adsk.core.Point3D.create(min_x - margin_cm, min_y - margin_cm, min_z - margin_cm),
+                (max_x + margin_cm) - (min_x - margin_cm),
+                ((min_y + max_y) / 2) - (min_y - margin_cm),
+                (max_z + margin_cm) - (min_z - margin_cm)
+            ),
+            'RIGHT': (
+                adsk.core.Point3D.create(min_x - margin_cm, (min_y + max_y) / 2, min_z - margin_cm),
+                (max_x + margin_cm) - (min_x - margin_cm),
+                (max_y + margin_cm) - ((min_y + max_y) / 2),
+                (max_z + margin_cm) - (min_z - margin_cm)
+            ),
+        }
 
         for pname in order:
-            if pname not in buckets:
-                continue
-            faces = buckets[pname]
-            if not faces:
-                d(f"{pname}: no faces found, skipping")
-                continue
-
-            d(f"{pname}: processing {len(faces)} faces (batch mode)...")
-            
-            # Phase A: Create ONE base feature for this entire panel
-            base_feat = base_features.add()
-            if not base_feat:
-                d(f"{pname}: failed to create base feature")
+            if pname not in slab_defs:
                 continue
             
-            base_feat.startEdit()
-            
-            # Copy all face surfaces into this base feature
-            panel_surfaces = []
-            for idx, face in enumerate(faces):
-                try:
-                    face_brep = temp_mgr.copy(face)
-                    if face_brep:
-                        surf_body = target_comp.bRepBodies.add(face_brep, base_feat)
-                        if surf_body:
-                            surf_body.name = f"SURF_{pname}_{idx+1:03d}"
-                            panel_surfaces.append(surf_body)
-                        else:
-                            continue
-                    else:
-                        continue
-                except Exception as face_err:
-                    pass
-                
-                # Progress log every 20 faces (less frequent to speed up)
-                if (idx + 1) % 20 == 0:
-                    d(f"{pname}: copied {idx+1}/{len(faces)} faces...")
-            
-            base_feat.finishEdit()
-            
-            if not panel_surfaces:
-                d(f"{pname}: no surface bodies created")
-                continue
-            
-            d(f"{pname}: created {len(panel_surfaces)} surface bodies, now stitching...")
-            all_surface_bodies.extend(panel_surfaces)
-            
-            # Phase B: Stitch all surface bodies into ONE quilt
             try:
-                # Build ObjectCollection of surface bodies (not faces)
-                surfaces_collection = adsk.core.ObjectCollection.create()
-                for surf_body in panel_surfaces:
-                    surfaces_collection.add(surf_body)
+                d(f"{pname}: creating slab and intersecting...")
                 
-                # Create tolerance ValueInput (use a small value, e.g., 0.01 cm)
-                tol_vi = adsk.core.ValueInput.createByReal(0.01)
+                origin, length_cm, width_cm, height_cm = slab_defs[pname]
                 
-                # Call stitch with 3-arg overload: (ObjectCollection, ValueInput, FeatureOperations)
-                stitch_input = stitch_feats.createInput(
-                    surfaces_collection,
-                    tol_vi,
-                    adsk.fusion.FeatureOperations.NewBodyFeatureOperation
+                # Create OrientedBoundingBox3D for the slab
+                pmin = origin
+                pmax = adsk.core.Point3D.create(
+                    origin.x + length_cm,
+                    origin.y + width_cm,
+                    origin.z + height_cm
                 )
                 
-                stitch_feat = stitch_feats.add(stitch_input)
+                # Calculate center and FULL dimensions (not halves)
+                center_x = (pmin.x + pmax.x) / 2.0
+                center_y = (pmin.y + pmax.y) / 2.0
+                center_z = (pmin.z + pmax.z) / 2.0
+                center = adsk.core.Point3D.create(center_x, center_y, center_z)
                 
-                if stitch_feat and stitch_feat.bodies and stitch_feat.bodies.count > 0:
-                    d(f"{pname}: stitched {len(panel_surfaces)} surfaces into {stitch_feat.bodies.count} body(s), now thickening...")
-                    
-                    # Collect all faces from stitched bodies
-                    stitch_faces = adsk.core.ObjectCollection.create()
-                    for stitch_body in stitch_feat.bodies:
-                        for sf in stitch_body.faces:
-                            stitch_faces.add(sf)
-                    
-                    # Phase B: Thicken the stitched surface ONCE
-                    thickness_vi = adsk.core.ValueInput.createByReal(-thickness_cm)
-                    t_in = thicken_feats.createInput(
-                        stitch_faces,
-                        thickness_vi,
-                        False,
-                        adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-                        True
-                    )
-                    
-                    t_feat = thicken_feats.add(t_in)
-                    
-                    if t_feat and t_feat.bodies and t_feat.bodies.count > 0:
-                        for i in range(t_feat.bodies.count):
-                            b = t_feat.bodies.item(i)
-                            if t_feat.bodies.count == 1:
-                                b.name = f"PANEL_{pname}"
-                            else:
-                                b.name = f"PANEL_{pname}_{i+1:02d}"
-                            b.isVisible = True
-                            created_count += 1
-                        created[pname] = t_feat
-                        d(f"{pname}: created {t_feat.bodies.count} panel body(s) ✓")
-                    else:
-                        d(f"{pname}: thicken produced no bodies")
-                else:
-                    d(f"{pname}: stitch produced no bodies")
-            except Exception as stitch_err:
-                d(f"{pname}: stitch/thicken FAILED: {stitch_err}")
+                full_length = pmax.x - pmin.x
+                full_width = pmax.y - pmin.y
+                full_height = pmax.z - pmin.z
+                
+                # Create direction vectors (X = length, Y = width, Z computed by right-hand rule)
+                length_dir = adsk.core.Vector3D.create(1, 0, 0)
+                width_dir = adsk.core.Vector3D.create(0, 1, 0)
+                
+                # Create OrientedBoundingBox3D: center, lengthDir, widthDir, length, width, height
+                obb = adsk.core.OrientedBoundingBox3D.create(center, length_dir, width_dir, full_length, full_width, full_height)
+                
+                # Create slab box from OBB
+                slab_box = temp_mgr.createBox(obb)
+                
+                if not slab_box:
+                    d(f"{pname}: FAILED: failed to create slab box")
+                    continue
+                
+                # Make a temp copy of the source solid (this will be mutated by booleanOperation)
+                panel_temp = temp_mgr.copy(source_body)
+                if panel_temp is None or (hasattr(panel_temp, "isValid") and not panel_temp.isValid):
+                    d(f"{pname}: FAILED: temp_mgr.copy(source_body) produced invalid temp body")
+                    continue
+                
+                # Boolean intersection:
+                # IMPORTANT: booleanOperation returns None and mutates panel_temp in-place.
+                temp_mgr.booleanOperation(
+                    panel_temp,
+                    slab_box,
+                    adsk.fusion.BooleanTypes.IntersectionBooleanType
+                )
+                
+                # After boolean, panel_temp is the result (or may become invalid if empty).
+                if hasattr(panel_temp, "isValid") and not panel_temp.isValid:
+                    d(f"{pname}: no intersection result (panel_temp invalid after boolean)")
+                    continue
+                
+                d(f"{pname}: intersection successful, adding body to component")
+                
+                # Use helper to insert (handles both parametric and direct modes)
+                panel_body = _add_temp_body_to_component(
+                    design=new_design,
+                    comp=target_comp,
+                    temp_body=panel_temp,
+                    name=f"PANEL_{pname}",
+                    logger=d
+                )
+                
+                created_count += 1
+                created[pname] = panel_body
+                d(f"{pname}: inserted {panel_body.name}")
+                
+            except Exception as panel_err:
+                d(f"{pname}: FAILED: {panel_err}")
                 d(traceback.format_exc())
+                continue
         
-        # Phase D: Resume compute and hide intermediate surfaces in bulk
+        # Phase D: Resume compute
         try:
             root.isComputeDeferred = False
         except:
             pass
-        
-        d("Hiding intermediate surface bodies...")
-        for surf_body in all_surface_bodies:
-            try:
-                surf_body.isVisible = False
-            except:
-                pass
 
         # Hide the original source solid (optional)
         try:
