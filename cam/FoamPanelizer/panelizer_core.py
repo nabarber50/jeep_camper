@@ -325,27 +325,35 @@ def panelize_step_into_new_design(app,
             d(f"{pname}: created {len(panel_surfaces)} surface bodies, now stitching...")
             all_surface_bodies.extend(panel_surfaces)
             
-            # Phase B: Stitch all surfaces into ONE quilt
+            # Phase B: Stitch all surface bodies into ONE quilt
             try:
-                stitch_input = stitch_feats.createInput(
-                    adsk.core.ObjectCollection.create()  # Empty for now
-                )
-                # Add all surface bodies to the stitch input
+                # Build ObjectCollection of surface bodies (not faces)
+                surfaces_collection = adsk.core.ObjectCollection.create()
                 for surf_body in panel_surfaces:
-                    for surf_face in surf_body.faces:
-                        stitch_input.faces.add(surf_face)
+                    surfaces_collection.add(surf_body)
+                
+                # Create tolerance ValueInput (use a small value, e.g., 0.01 cm)
+                tol_vi = adsk.core.ValueInput.createByReal(0.01)
+                
+                # Call stitch with 3-arg overload: (ObjectCollection, ValueInput, FeatureOperations)
+                stitch_input = stitch_feats.createInput(
+                    surfaces_collection,
+                    tol_vi,
+                    adsk.fusion.FeatureOperations.NewBodyFeatureOperation
+                )
                 
                 stitch_feat = stitch_feats.add(stitch_input)
                 
                 if stitch_feat and stitch_feat.bodies and stitch_feat.bodies.count > 0:
-                    stitched_body = stitch_feat.bodies.item(0)
-                    d(f"{pname}: stitched into 1 body, now thickening...")
+                    d(f"{pname}: stitched {len(panel_surfaces)} surfaces into {stitch_feat.bodies.count} body(s), now thickening...")
+                    
+                    # Collect all faces from stitched bodies
+                    stitch_faces = adsk.core.ObjectCollection.create()
+                    for stitch_body in stitch_feat.bodies:
+                        for sf in stitch_body.faces:
+                            stitch_faces.add(sf)
                     
                     # Phase B: Thicken the stitched surface ONCE
-                    stitch_faces = adsk.core.ObjectCollection.create()
-                    for sf in stitched_body.faces:
-                        stitch_faces.add(sf)
-                    
                     thickness_vi = adsk.core.ValueInput.createByReal(-thickness_cm)
                     t_in = thicken_feats.createInput(
                         stitch_faces,
