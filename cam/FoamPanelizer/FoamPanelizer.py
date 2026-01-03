@@ -1,4 +1,4 @@
-import os, sys, traceback
+import os, sys, traceback, importlib
 
 # Ensure this script's directory is on sys.path (Fusion does NOT do this reliably)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -76,9 +76,13 @@ except ImportError as e:
 TARGET_KEYWORDS = ["CAMPER BASE", "CAMBER BASE"]
 STEP_PATH = r"C:\temp\panelize_export.step"
 CAPTURE_DEPTH = "80 mm"
-REAR_SIDE = "MIN_Z"   # or "MAX_Z"
-PANEL_PRIORITY = ["TOP", "LEFT", "RIGHT", "REAR"]
+PANEL_PRIORITY = ["TOP", "LEFT", "RIGHT", "REAR"]  # Panels to extract (front and bottom are OPEN)
 KEEP_TOOL_SLABS_VISIBLE = False
+# Note: Coordinate system (from geometry analysis):
+#   X = length (front-back, the long axis)
+#   Y = width (left-right)
+#   Z = height (up-down)
+# Only 4 panels: TOP, LEFT, RIGHT, REAR (front and bottom open for access)
 # -----------------------------
 
 def run(context):
@@ -138,10 +142,11 @@ def run(context):
                 ui.messageBox(f"Export folder does not exist:\n{export_dir}\n\nCreate it and re-run.\n\nLog:\n{log_path}")
             return
 
-        # Import panelizer_core (robust)
+        # Import panelizer_core (robust) with forced reload to pick up changes
         logger.log("Importing panelizer_core...")
         try:
             import panelizer_core
+            importlib.reload(panelizer_core)  # Force reload to pick up code changes
         except Exception as e:
             logger.log("FAILED import panelizer_core: " + repr(e))
             if ui:
@@ -177,7 +182,6 @@ def run(context):
             ui=ui,
             step_path=STEP_PATH,
             capture_expr=CAPTURE_DEPTH,
-            rear_side=REAR_SIDE,
             panel_priority=PANEL_PRIORITY,
             keep_tools_visible=KEEP_TOOL_SLABS_VISIBLE,
             source_camera=app.activeViewport.camera

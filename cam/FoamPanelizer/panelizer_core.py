@@ -1,4 +1,4 @@
-import adsk.core, adsk.fusion, traceback, os
+import adsk.core, adsk.fusion, traceback, os, sys
 
 def find_target_occurrence(root: adsk.fusion.Component, keywords):
     keys = [k.lower() for k in keywords]
@@ -49,11 +49,64 @@ def _combine(comp, target_body, tool_body, op):
     ci.isNewComponent = False
     combine.add(ci)
 
-def panelize_step_into_new_design(app, ui, step_path, capture_expr, rear_side, panel_priority, keep_tools_visible, source_camera):
+def panelize_step_into_new_design(app, ui, step_path, capture_expr, panel_priority, keep_tools_visible, source_camera):
+    """
+    Slice a camper into panel components.
+    
+    Coordinate system:
+      X = width (left-right, min_x is LEFT, max_x is RIGHT)
+      Y = length (front-back, min_y is FRONT, max_y is REAR)
+      Z = height (up-down, max_z is TOP, min_z is BOTTOM)
+    
+    Panels created (front and bottom are OPEN):
+      TOP   - high Z values (roof)
+      REAR  - high Y values (back wall)
+      LEFT  - low X values (left side)
+      RIGHT - high X values (right side)
+    """
+    debug_log = []
+    debug_log.append("=== panelize_step_into_new_design START ===")
+    debug_log.append(f"  panel_priority: {panel_priority}")
+    
+    def write_debug():
+        try:
+            # Simple approach: use the directory that FoamPanelizer.py already created
+            # Just get it from os.environ or reconstruct it
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            logs_root = os.path.join(desktop, "fusion_cam_logs")
+            
+            # Find the most recent timestamped folder
+            if os.path.isdir(logs_root):
+                folders = [os.path.join(logs_root, d) for d in os.listdir(logs_root) 
+                          if os.path.isdir(os.path.join(logs_root, d))]
+                if folders:
+                    latest_folder = max(folders, key=os.path.getmtime)
+                    debug_file = os.path.join(latest_folder, "panelizer_debug.log")
+                    with open(debug_file, "w", encoding="utf-8") as f:
+                        f.write("\n".join(debug_log))
+                        f.flush()
+                    return
+        except Exception as e:
+            pass
+        
+        # Fallback to Desktop
+        try:
+            fallback = os.path.join(os.path.expanduser("~"), "Desktop", "panelizer_debug.log")
+            with open(fallback, "w", encoding="utf-8") as f:
+                f.write("\n".join(debug_log))
+                f.flush()
+        except:
+            pass
+    
+    # Write immediate start marker
+    write_debug()
+    
     try:
         new_doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
         new_design = adsk.fusion.Design.cast(new_doc.products.itemByProductType('DesignProductType'))
         if not new_design:
+            debug_log.append("ERROR: Failed to create new design")
+            write_debug()
             return {'ok': False}
 
         try:
@@ -67,6 +120,8 @@ def panelize_step_into_new_design(app, ui, step_path, capture_expr, rear_side, p
         root = new_design.rootComponent
 
         if not os.path.isfile(step_path):
+            debug_log.append(f"ERROR: STEP not found: {step_path}")
+            write_debug()
             ui.messageBox('STEP not found:\n' + step_path)
             return {'ok': False}
 
@@ -80,96 +135,145 @@ def panelize_step_into_new_design(app, ui, step_path, capture_expr, rear_side, p
 
         solids = _collect_solids(target_comp)
         if not solids:
+            debug_log.append("ERROR: No solids after import")
+            write_debug()
             ui.messageBox('No solids after import.')
             return {'ok': False}
 
         capture_cm = units.evaluateExpression(capture_expr, 'cm')
         ext = _get_bbox_extents(target_comp)
         if not ext:
+            debug_log.append("ERROR: Could not get bbox extents")
+            write_debug()
             return {'ok': False}
         min_x, max_x, min_y, max_y, min_z, max_z = ext
+        
+        # Debug: print bbox dimensions to understand orientation
+        # ACTUAL ORIENTATION (from log analysis):
+        # X = 243.58 cm (LONGEST - this is front-back, the long axis)
+        # Y = 63.50 cm (SHORTEST - this is left-right, the width)
+        # Z = 146.68 cm (MIDDLE - this is up-down, the height)
+        # So real coordinates: X=length, Y=width, Z=height (rotated 90° from expected)
+        width_x = max_x - min_x
+        length_y = max_y - min_y
+        height_z = max_z - min_z
+        debug_log.append(f"BBox dimensions (cm):")
+        debug_log.append(f"  X (actual length/long-axis): {width_x:.2f} cm")
+        debug_log.append(f"  Y (actual width/left-right):  {length_y:.2f} cm")
+        debug_log.append(f"  Z (actual height/up-down):    {height_z:.2f} cm")
+        debug_log.append(f"  Z (height): {height_z:.2f} cm  [{min_z:.2f} to {max_z:.2f}]")
+        debug_log.append(f"Expected: Y should be longest (front-back), Z should be tallest (up-down)")
+        
         margin = capture_cm * 0.25
 
         temp_mgr = adsk.fusion.TemporaryBRepManager.get()
 
         def make_slab(tag, min_pt, max_pt):
-            # Compute center + extents (Fusion internal length units are cm)
             cx = 0.5 * (min_pt.x + max_pt.x)
             cy = 0.5 * (min_pt.y + max_pt.y)
             cz = 0.5 * (min_pt.z + max_pt.z)
-
-            length = abs(max_pt.x - min_pt.x)  # along X
-            width  = abs(max_pt.y - min_pt.y)  # along Y
-            height = abs(max_pt.z - min_pt.z)  # along Z
-
+            length = abs(max_pt.x - min_pt.x)
+            width  = abs(max_pt.y - min_pt.y)
+            height = abs(max_pt.z - min_pt.z)
             center = adsk.core.Point3D.create(cx, cy, cz)
-
-            # Define box orientation axes:
-            # lengthDirection = +X, widthDirection = +Y => height is +Z via right-hand rule
             length_dir = adsk.core.Vector3D.create(1, 0, 0)
             width_dir  = adsk.core.Vector3D.create(0, 1, 0)
-
             obb = adsk.core.OrientedBoundingBox3D.create(center, length_dir, width_dir, length, width, height)
             temp_box = temp_mgr.createBox(obb)
-
             return _insert_temp_body(target_comp, temp_box, f'_TOOL_{tag}', keep_tools_visible)
 
+        # Create slabs for each panel
+        # ACTUAL ORIENTATION: X=length (front-back), Y=width (left-right), Z=height (up-down)
+        # TOP   - high Z values (roof)
+        # REAR  - high X values (back, far end of long axis)
+        # LEFT  - low Y values (left side)
+        # RIGHT - high Y values (right side)
         slabs = {
             'TOP': make_slab('TOP',
-                adsk.core.Point3D.create(min_x - margin, max_y - capture_cm, min_z - margin),
+                adsk.core.Point3D.create(min_x - margin, min_y - margin, max_z - capture_cm),
+                adsk.core.Point3D.create(max_x + margin, max_y + margin, max_z + margin)),
+            'REAR': make_slab('REAR',
+                adsk.core.Point3D.create(max_x - capture_cm, min_y - margin, min_z - margin),
                 adsk.core.Point3D.create(max_x + margin, max_y + margin, max_z + margin)),
             'LEFT': make_slab('LEFT',
                 adsk.core.Point3D.create(min_x - margin, min_y - margin, min_z - margin),
-                adsk.core.Point3D.create(min_x + capture_cm, max_y + margin, max_z + margin)),
+                adsk.core.Point3D.create(max_x + margin, min_y + capture_cm, max_z + margin)),
             'RIGHT': make_slab('RIGHT',
-                adsk.core.Point3D.create(max_x - capture_cm, min_y - margin, min_z - margin),
+                adsk.core.Point3D.create(min_x - margin, max_y - capture_cm, min_z - margin),
                 adsk.core.Point3D.create(max_x + margin, max_y + margin, max_z + margin)),
         }
-        if rear_side.upper() == 'MAX_Z':
-            slabs['REAR'] = make_slab('REAR',
-                adsk.core.Point3D.create(min_x - margin, min_y - margin, max_z - capture_cm),
-                adsk.core.Point3D.create(max_x + margin, max_y + margin, max_z + margin))
-        else:
-            slabs['REAR'] = make_slab('REAR',
-                adsk.core.Point3D.create(min_x - margin, min_y - margin, min_z - margin),
-                adsk.core.Point3D.create(max_x + margin, max_y + margin, min_z + capture_cm))
 
         extracted = 0
-        # Simple: intersect each solid with slab into new bodies by duplicating each body as tool target.
-        # For v1, we operate in-place per-body (may create multiple bodies).
+        panel_results = {}
+        
+        debug_log.append(f"Creating panels in order: {panel_priority}")
+        debug_log.append(f"Original solids count: {len(solids)}")
+        
+        # Get the first solid as our source geometry
+        if not solids:
+            ui.messageBox('No solids to panelize')
+            return {'ok': False}
+        
+        source_solid = solids[0]
+        debug_log.append(f"Source solid: {source_solid.name}")
+        
+        # For each panel, COPY the source solid and intersect the copy with the slab
+        temp_mgr = adsk.fusion.TemporaryBRepManager.get()
+        
         for pname in panel_priority:
             pname = pname.upper()
             slab = slabs.get(pname)
             if not slab:
+                debug_log.append(f"  Skipping {pname} - not in slabs dict")
                 continue
-            for b in list(_collect_solids(target_comp)):
-                try:
-                    _combine(target_comp, b, slab, adsk.fusion.FeatureOperations.IntersectFeatureOperation)
-                except:
-                    pass
-            # Rename bodies near the slab side
-            for b in _collect_solids(target_comp):
-                bb = b.boundingBox
-                cx = 0.5*(bb.minPoint.x+bb.maxPoint.x)
-                cy = 0.5*(bb.minPoint.y+bb.maxPoint.y)
-                cz = 0.5*(bb.minPoint.z+bb.maxPoint.z)
-                ok=False
-                if pname=='TOP' and cy >= (max_y - capture_cm*0.9): ok=True
-                if pname=='LEFT' and cx <= (min_x + capture_cm*0.9): ok=True
-                if pname=='RIGHT' and cx >= (max_x - capture_cm*0.9): ok=True
-                if pname=='REAR':
-                    if rear_side.upper()=='MAX_Z' and cz >= (max_z - capture_cm*0.9): ok=True
-                    if rear_side.upper()!='MAX_Z' and cz <= (min_z + capture_cm*0.9): ok=True
-                if ok and not b.name.startswith('PANEL_'):
-                    extracted += 1
-                    b.name = f'PANEL_{pname}_{extracted:02d}'
-                    b.isVisible = True
-
+            
+            debug_log.append(f"  Creating {pname} panel...")
+            try:
+                # Copy the source solid using TemporaryBRepManager
+                source_brep = temp_mgr.copy(source_solid)
+                
+                # Perform boolean intersection at BRep level
+                slab_brep = temp_mgr.copy(slab)
+                temp_mgr.booleanOperation(source_brep, slab_brep, adsk.fusion.BooleanTypes.IntersectionBooleanType)
+                
+                # Add the intersected result as new body
+                bf = target_comp.features.baseFeatures.add()
+                bf.startEdit()
+                result_body = target_comp.bRepBodies.add(source_brep, bf)
+                bf.finishEdit()
+                result_body.name = f'PANEL_{pname}'
+                result_body.isVisible = True
+                
+                extracted += 1
+                panel_results[pname] = result_body
+                debug_log.append(f"    ✓ Created PANEL_{pname}")
+            except Exception as e:
+                debug_log.append(f"    ✗ Failed to create {pname} panel: {e}")
+                debug_log.append(traceback.format_exc())
+        
+        # Hide the original source solid
+        source_solid.isVisible = False
+        debug_log.append(f"Hidden original solid: {source_solid.name}")
+        
+        # Hide tool slabs if requested
         if not keep_tools_visible:
             for s in slabs.values():
                 s.isVisible = False
+        
+        # Hide non-panel solids
+        for b in _collect_solids(target_comp):
+            if not b.name.startswith('PANEL_'):
+                b.isVisible = False
+
+        debug_log.append(f"Final panel count: {extracted}")
+        debug_log.append("=== panelize_step_into_new_design END ===")
+        write_debug()
 
         return {'ok': True, 'doc_name': new_doc.name, 'panel_count': extracted}
-    except:
+    except Exception as exc:
+        debug_log.append(f"=== panelize_step_into_new_design EXCEPTION ===")
+        debug_log.append(f"{exc}")
+        debug_log.append(traceback.format_exc())
+        write_debug()
         ui.messageBox('panelizer_core failed:\n' + traceback.format_exc())
         return {'ok': False}

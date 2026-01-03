@@ -1,0 +1,15 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "com.nick.box_slicer",
+  "name": "Box Slicer",
+  "author": "Nick",
+  "description": "Fit panels to standard stock sizes and generate rectangular boxes for optimal CNC manufacturing. Analyzes panel dimensions, calculates lamination (stacking), and prepares boxes for nesting.",
+  "version": "1.0.0",
+  "runOnStartup": false,
+  "supportedOS": [
+    "windows",
+    "mac"
+  ],
+  "editEnabled": true
+}

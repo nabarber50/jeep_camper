@@ -78,6 +78,11 @@ class Config(object):
         ("WIDE_6x10", 1828.8, 3048.0),
     ]
     
+    # ---- Foam Stock & Lamination ----
+    FOAM_THICKNESS_MM = 38.1  # Standard foam thickness in mm
+    ALLOW_LAMINATION = True  # Allow stacking multiple foam pieces for deeper panels
+    LAMINATION_MAX_LAYERS = 3  # Maximum number of layers to stack
+    
     # ---- Packing Optimization ----
     # Packing strategy: 'shelf' (fast, simple rows) or 'smart' (better density, slower)
     # 'shelf': Left-to-right rows, largest parts first (current default)
@@ -276,26 +281,29 @@ class Config(object):
     def ensure_log_folder():
         """Ensure the log folder exists and return the path."""
         return Config.get_run_log_folder()
-    
-    # Create the log folder immediately
-    _log_folder = None
-    try:
-        _log_folder = get_run_log_folder.__func__(Config)
-    except Exception:
-        pass
-    
-    # Use the created folder or fall back to Desktop
-    if _log_folder and os.path.isdir(_log_folder):
-        LOG_PATH_CAM = os.path.join(_log_folder, "fusion_cam_log.txt")
-        LOG_PATH_NESTING = os.path.join(_log_folder, "fusion_cam_nesting.txt")
-        LOG_PATH_PANELIZER = os.path.join(_log_folder, "fusion_cam_panelizer.txt")
-        LOG_PATH_CAM_OPS = os.path.join(_log_folder, "fusion_cam_operations.txt")
-    else:
-        # Fallback to Desktop if folder creation fails
-        _desktop = get_desktop_path.__func__(Config)
-        LOG_PATH_CAM = os.path.join(_desktop, "fusion_cam_log.txt")
-        LOG_PATH_NESTING = os.path.join(_desktop, "fusion_cam_nesting.txt")
-        LOG_PATH_PANELIZER = os.path.join(_desktop, "fusion_cam_panelizer.txt")
-        LOG_PATH_CAM_OPS = os.path.join(_desktop, "fusion_cam_operations.txt")
-    
-    LAYER_NAME_RE = re.compile(r'^Layer_\d+_part_\d+$', re.IGNORECASE)
+
+
+# Create the log folder immediately when module loads
+_log_folder = None
+try:
+    _log_folder = Config.get_run_log_folder()
+except Exception:
+    pass
+
+# Use the created folder or fall back to Desktop
+if _log_folder and os.path.isdir(_log_folder):
+    LOG_PATH_CAM = os.path.join(_log_folder, "fusion_cam_log.txt")
+    LOG_PATH_NESTING = os.path.join(_log_folder, "fusion_cam_nesting.txt")
+    LOG_PATH_PANELIZER = os.path.join(_log_folder, "fusion_cam_panelizer.txt")
+    LOG_PATH_SLICER = os.path.join(_log_folder, "fusion_cam_slicer.txt")
+    LOG_PATH_CAM_OPS = os.path.join(_log_folder, "fusion_cam_operations.txt")
+else:
+    # Fallback to Desktop if folder creation fails
+    _desktop = Config.get_desktop_path()
+    LOG_PATH_CAM = os.path.join(_desktop, "fusion_cam_log.txt")
+    LOG_PATH_NESTING = os.path.join(_desktop, "fusion_cam_nesting.txt")
+    LOG_PATH_PANELIZER = os.path.join(_desktop, "fusion_cam_panelizer.txt")
+    LOG_PATH_SLICER = os.path.join(_desktop, "fusion_cam_slicer.txt")
+    LOG_PATH_CAM_OPS = os.path.join(_desktop, "fusion_cam_operations.txt")
+
+LAYER_NAME_RE = re.compile(r'^Layer_\d+_part_\d+$', re.IGNORECASE)
