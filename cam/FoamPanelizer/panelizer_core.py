@@ -36,29 +36,52 @@ def _scaled_point(p: adsk.core.Point3D, n: adsk.core.Vector3D, dist_cm: float) -
     return adsk.core.Point3D.create(p.x + n.x * dist_cm, p.y + n.y * dist_cm, p.z + n.z * dist_cm)
 
 
-def _get_outward_normal(body: adsk.fusion.BRepBody, face: adsk.fusion.BRepFace, eps_cm: float) -> adsk.core.Vector3D:
+def _get_outward_normal(body: adsk.fusion.BRepBody, face: adsk.fusion.BRepFace, 
+                        bbox_center: adsk.core.Point3D, eps_cm: float) -> adsk.core.Vector3D:
     """
-    Returns an *outward* unit normal for an exterior face by sampling a point and
-    checking point containment of a small step along the normal.
+    Returns an *outward* unit normal using cheap heuristic first, then optional containment check.
+    Phase C optimization: use dot(normal, normalize(facePoint - bboxCenter)) to decide flip;
+    only call pointContainment() if ambiguous.
     """
     p = face.pointOnFace
     ok, n = face.evaluator.getNormalAtPoint(p)
     if not ok:
-        # fallback: arbitrary up
         return _v(0, 0, 1)
 
     n.normalize()
 
-    # If stepping along n goes INSIDE the body, the normal is inward -> flip.
-    p_out = _scaled_point(p, n, eps_cm)
-
+    # Cheap heuristic: dot product with vector from bbox center to face point
+    # If negative, normal likely points inward
     try:
-        rel = body.pointContainment(p_out)  # returns PointContainment enum :contentReference[oaicite:1]{index=1}
-        # Inside means we stepped inward, so flip to get outward.
+        to_face = adsk.core.Vector3D.create(
+            p.x - bbox_center.x,
+            p.y - bbox_center.y,
+            p.z - bbox_center.z
+        )
+        to_face.normalize()
+        heur_dot = _dot(n, to_face)
+        
+        # If very confident (heur_dot > 0.1), trust the heuristic
+        if heur_dot > 0.1:
+            # Normal likely points outward
+            n.normalize()
+            return n
+        elif heur_dot < -0.1:
+            # Normal likely points inward, flip
+            n.scaleBy(-1.0)
+            n.normalize()
+            return n
+        # else: ambiguous, use pointContainment
+    except:
+        pass
+
+    # Ambiguous or heuristic failed: use pointContainment
+    p_out = _scaled_point(p, n, eps_cm)
+    try:
+        rel = body.pointContainment(p_out)
         if rel == adsk.fusion.PointContainment.PointInsidePointContainment:
             n.scaleBy(-1.0)
     except:
-        # If containment fails, keep the sampled normal
         pass
 
     n.normalize()
@@ -210,6 +233,7 @@ def panelize_step_into_new_design(app,
         dx, dy, dz = (max_x - min_x), (max_y - min_y), (max_z - min_z)
         diag = max(1e-6, (dx*dx + dy*dy + dz*dz) ** 0.5)
         eps_cm = max(0.01, diag * 0.001)  # ~0.1% of diag, min 0.01 cm
+        bbox_center = adsk.core.Point3D.create((min_x + max_x) / 2, (min_y + max_y) / 2, (min_z + max_z) / 2)
         d(f"bbox dx,dy,dz(cm)=({dx:.3f},{dy:.3f},{dz:.3f}) eps_cm={eps_cm:.4f}")
 
         # 1) Classify faces
@@ -221,7 +245,7 @@ def panelize_step_into_new_design(app,
                 # Heuristic: skip tiny faces (optional) – keep it conservative
                 # if face.area < 1e-6: continue
 
-                out_n = _get_outward_normal(source_body, face, eps_cm)
+                out_n = _get_outward_normal(source_body, face, bbox_center, eps_cm)
                 cls = _classify_face_option_b(out_n, thr=0.65)
 
                 if cls in buckets:
@@ -233,18 +257,22 @@ def panelize_step_into_new_design(app,
 
         d(f"classified faces: TOP={len(buckets['TOP'])} REAR={len(buckets['REAR'])} LEFT={len(buckets['LEFT'])} RIGHT={len(buckets['RIGHT'])} skipped={skipped}")
 
-        # 2) Extract faces as surface bodies, then thicken to create solid panels
-        # Fusion API limitation: thickenFeatures cannot work on faces from solid bodies
-        # Solution: Copy each face as BRep surface, add as base feature, then thicken
-        # Note: Skip stitching (too slow with hundreds of faces), create multiple bodies per panel
+        # 2) Phase A-D: Batch surface creation, stitch, thicken
+        # Phase D: defer compute during batch operations
+        try:
+            root.isComputeDeferred = True
+        except:
+            pass
         
         temp_mgr = adsk.fusion.TemporaryBRepManager.get()
         thickness_cm = float(capture_cm)
+        stitch_feats = target_comp.features.stitchFeatures
         thicken_feats = target_comp.features.thickenFeatures
         base_features = target_comp.features.baseFeatures
 
         created = {}
         created_count = 0
+        all_surface_bodies = []  # Track for bulk hide later
 
         # ensure order
         order = [p.upper() for p in (panel_priority or ['TOP','LEFT','RIGHT','REAR'])]
@@ -257,42 +285,70 @@ def panelize_step_into_new_design(app,
                 d(f"{pname}: no faces found, skipping")
                 continue
 
-            d(f"{pname}: processing {len(faces)} faces (creating individual surface bodies)...")
+            d(f"{pname}: processing {len(faces)} faces (batch mode)...")
             
-            panel_bodies = []
-            batch_size = 10  # Process 10 faces per batch for progress updates
+            # Phase A: Create ONE base feature for this entire panel
+            base_feat = base_features.add()
+            if not base_feat:
+                d(f"{pname}: failed to create base feature")
+                continue
             
-            # Process faces in batches to avoid hanging on huge unions
-            # Create individual surface bodies and thicken each
+            base_feat.startEdit()
+            
+            # Copy all face surfaces into this base feature
+            panel_surfaces = []
             for idx, face in enumerate(faces):
                 try:
-                    # Copy face as BRep surface
                     face_brep = temp_mgr.copy(face)
-                    if not face_brep:
+                    if face_brep:
+                        surf_body = target_comp.bRepBodies.add(face_brep, base_feat)
+                        if surf_body:
+                            surf_body.name = f"SURF_{pname}_{idx+1:03d}"
+                            panel_surfaces.append(surf_body)
+                        else:
+                            continue
+                    else:
                         continue
+                except Exception as face_err:
+                    pass
+                
+                # Progress log every 20 faces (less frequent to speed up)
+                if (idx + 1) % 20 == 0:
+                    d(f"{pname}: copied {idx+1}/{len(faces)} faces...")
+            
+            base_feat.finishEdit()
+            
+            if not panel_surfaces:
+                d(f"{pname}: no surface bodies created")
+                continue
+            
+            d(f"{pname}: created {len(panel_surfaces)} surface bodies, now stitching...")
+            all_surface_bodies.extend(panel_surfaces)
+            
+            # Phase B: Stitch all surfaces into ONE quilt
+            try:
+                stitch_input = stitch_feats.createInput(
+                    adsk.core.ObjectCollection.create()  # Empty for now
+                )
+                # Add all surface bodies to the stitch input
+                for surf_body in panel_surfaces:
+                    for surf_face in surf_body.faces:
+                        stitch_input.faces.add(surf_face)
+                
+                stitch_feat = stitch_feats.add(stitch_input)
+                
+                if stitch_feat and stitch_feat.bodies and stitch_feat.bodies.count > 0:
+                    stitched_body = stitch_feat.bodies.item(0)
+                    d(f"{pname}: stitched into 1 body, now thickening...")
                     
-                    # Add as base feature body
-                    base_feat = base_features.add()
-                    if not base_feat:
-                        continue
-                    
-                    base_feat.startEdit()
-                    surf_body = target_comp.bRepBodies.add(face_brep, base_feat)
-                    if not surf_body:
-                        base_feat.finishEdit()
-                        continue
-                    
-                    surf_body.name = f"SURF_{pname}_{idx+1:03d}"
-                    base_feat.finishEdit()
-                    
-                    # Thicken this surface
-                    surf_faces_col = adsk.core.ObjectCollection.create()
-                    for sf in surf_body.faces:
-                        surf_faces_col.add(sf)
+                    # Phase B: Thicken the stitched surface ONCE
+                    stitch_faces = adsk.core.ObjectCollection.create()
+                    for sf in stitched_body.faces:
+                        stitch_faces.add(sf)
                     
                     thickness_vi = adsk.core.ValueInput.createByReal(-thickness_cm)
                     t_in = thicken_feats.createInput(
-                        surf_faces_col,
+                        stitch_faces,
                         thickness_vi,
                         False,
                         adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
@@ -304,39 +360,34 @@ def panelize_step_into_new_design(app,
                     if t_feat and t_feat.bodies and t_feat.bodies.count > 0:
                         for i in range(t_feat.bodies.count):
                             b = t_feat.bodies.item(i)
-                            b.name = f"PANEL_{pname}_{idx+1:03d}"
+                            if t_feat.bodies.count == 1:
+                                b.name = f"PANEL_{pname}"
+                            else:
+                                b.name = f"PANEL_{pname}_{i+1:02d}"
                             b.isVisible = True
-                            panel_bodies.append(b)
                             created_count += 1
-                        
-                        # Hide intermediate surface
-                        try:
-                            surf_body.isVisible = False
-                        except:
-                            pass
-                    
-                    # Progress logging every batch_size faces
-                    if (idx + 1) % batch_size == 0:
-                        msg = f"{pname}: processed {idx+1}/{len(faces)} faces..."
-                        d(msg)
-                        # Also try to write progress to file immediately for debugging
-                        if dbg_path:
-                            try:
-                                with open(dbg_path, "a", encoding="utf-8") as f:
-                                    f.write(msg + "\n")
-                                    f.flush()
-                            except:
-                                pass
-                        
-                except Exception as face_err:
-                    # Skip problematic faces, log error
-                    d(f"{pname} face {idx+1}: {str(face_err)[:80]}")
-            
-            if panel_bodies:
-                created[pname] = panel_bodies
-                d(f"{pname}: created {len(panel_bodies)} panel body(s) from {len(faces)} faces")
-            else:
-                d(f"{pname}: no bodies created")
+                        created[pname] = t_feat
+                        d(f"{pname}: created {t_feat.bodies.count} panel body(s) ✓")
+                    else:
+                        d(f"{pname}: thicken produced no bodies")
+                else:
+                    d(f"{pname}: stitch produced no bodies")
+            except Exception as stitch_err:
+                d(f"{pname}: stitch/thicken FAILED: {stitch_err}")
+                d(traceback.format_exc())
+        
+        # Phase D: Resume compute and hide intermediate surfaces in bulk
+        try:
+            root.isComputeDeferred = False
+        except:
+            pass
+        
+        d("Hiding intermediate surface bodies...")
+        for surf_body in all_surface_bodies:
+            try:
+                surf_body.isVisible = False
+            except:
+                pass
 
         # Hide the original source solid (optional)
         try:
