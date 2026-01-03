@@ -335,10 +335,11 @@ def slice_in_new_design(app: adsk.core.Application, ui: adsk.core.UserInterface,
             g_input.entities = coll
             groups.add(g_input)
     elif ENABLE_SLICE_GROUPS:
-        ui.messageBox(
-            'Slice grouping is enabled, but this design environment '
-            'does not support Component.groups. Skipping groups.'
-        )
+        pass
+        # ui.messageBox(
+        #     'Slice grouping is enabled, but this design environment '
+        #     'does not support Component.groups. Skipping groups.'
+        # )
 
     # ------------------------------------------------------------------
     # Optional: alignment holes (datum features) through all slices
@@ -509,6 +510,27 @@ def run(context):
     try:
         app = adsk.core.Application.get()
         ui = app.userInterface
+        
+        # Check design mode and warn if not in direct modeling
+        doc = app.activeDocument
+        if doc:
+            try:
+                design = adsk.fusion.Design.cast(doc.products.itemByProductType('DesignProductType'))
+                if design:
+                    is_direct = design.designType == adsk.fusion.DesignTypes.DirectModelingDesignType
+                    if not is_direct:
+                        ui.messageBox(
+                            "⚠️  WARNING: This design is in Parametric mode (design history enabled).\n\n"
+                            "For best compatibility with the slicing script, switch to Direct Modeling:\n\n"
+                            "Option 1: File → Workspace → Modeling\n"
+                            "Option 2: Design menu → Toggle Design History OFF\n\n"
+                            "The script will attempt to continue, but you may encounter API limitations.\n"
+                            "Switching to Direct Modeling is strongly recommended."
+                        )
+            except Exception:
+                pass  # Design mode check failed, continue anyway
+        app = adsk.core.Application.get()
+        ui = app.userInterface
         logger = AppLogger(path=r"C:\temp\test.out", ui=ui, raise_on_fail=True)
 
         doc = app.activeDocument
@@ -572,11 +594,11 @@ def run(context):
         step_opts = export_mgr.createSTEPExportOptions(STEP_EXPORT_PATH, target_comp)
         export_mgr.execute(step_opts)
 
-        ui.messageBox(
-            'Export complete.\n\n'
-            f'Exported component "{target_comp.name}" as STEP to:\n{STEP_EXPORT_PATH}\n\n'
-            'Now creating a NEW design, importing that geometry, slicing, and post-processing there.'
-        )
+        # ui.messageBox(
+        #     'Export complete.\n\n'
+        #     f'Exported component "{target_comp.name}" as STEP to:\n{STEP_EXPORT_PATH}\n\n'
+        #     'Now creating a NEW design, importing that geometry, slicing, and post-processing there.'
+        # )
 
         # Capture current camera so new design uses same view orientation
         source_camera = app.activeViewport.camera

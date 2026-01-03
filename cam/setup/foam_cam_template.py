@@ -13,12 +13,14 @@ import adsk.core, adsk.fusion, adsk.cam
 # folder containing this entry script
 _here = os.path.dirname(os.path.abspath(__file__))
 
-# If your package lives next to this script as: <something>/foamcam/...
-# then the parent of that folder must be on sys.path.
-_repo_root = _here  # adjust if needed (see note below)
+# Add both the setup directory (for foamcam package) and parent cam directory (for common)
+_repo_root = _here  # setup/ folder
+_cam_root = os.path.dirname(_here)  # cam/ folder
 
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
+if _cam_root not in sys.path:
+    sys.path.insert(1, _cam_root)
 
 # Force reload of foamcam modules to pick up code changes (bypass __pycache__)
 _foamcam_modules = [m for m in list(sys.modules.keys()) if m.startswith('foamcam')]
@@ -29,8 +31,8 @@ for mod_name in _foamcam_modules:
         pass
     
 try:
-    from foamcam.config import Config
-    from foamcam.logging import AppLogger
+    from common.config import Config
+    from common.logging import AppLogger
     from foamcam.units import Units
     from foamcam.collect import collect_layout_bodies
     from foamcam.nesting import SheetNester
@@ -53,7 +55,7 @@ def run(context):
         app = adsk.core.Application.get()
         ui  = app.userInterface
         doc = app.activeDocument
-        _logger = AppLogger(path=Config.LOG_PATH, ui=ui, raise_on_fail=True)
+        _logger = AppLogger(path=Config.LOG_PATH_NESTING, ui=ui, raise_on_fail=True)
         _logger.log("=== RUN START ===")
         # Quick diagnostic to confirm which config flags are active at runtime
         _logger.log(
@@ -63,6 +65,26 @@ def run(context):
             f"ALLOW_ROTATE_90={getattr(Config,'ALLOW_ROTATE_90',None)}"
         )
         
+        # Check design mode and warn if not in direct modeling
+        try:
+            design = adsk.fusion.Design.cast(app.activeProduct)
+
+            if not design:
+                ui.messageBox('No active design', 'No Design')
+                return
+
+            # Check the current modeling mode
+            if design.designType == adsk.fusion.DesignTypes.DirectDesignType:
+                ui.messageBox('Design is already in Direct Modeling mode.')
+            else:
+                # Attempt to change to Direct Modeling mode
+                # NOTE: This will trigger a UI prompt for the user to confirm history deletion
+                design.designType = adsk.fusion.DesignTypes.DirectDesignType
+                ui.messageBox('Design has been switched to Direct Modeling mode (user confirmation required in UI).')
+        except:
+            if ui:
+                ui.messageBox('Failed:\n{}'.format(traceback.format_exc()))
+            
         # Clear sheet registry at start of each run
         clear_registry()
         

@@ -1,0 +1,15 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "com.nick.foam_panelizer",
+  "name": "Foam Panelizer",
+  "author": "Nick",
+  "description": "Panel-first decomposition (Top/Left/Right/Rear) for foam CNC workflows.",
+  "version": "1.0.2",
+  "runOnStartup": false,
+  "supportedOS": [
+    "windows",
+    "mac"
+  ],
+  "editEnabled": true
+}

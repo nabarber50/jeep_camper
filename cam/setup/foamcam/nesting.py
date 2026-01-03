@@ -209,13 +209,23 @@ class SheetNester:
           - flatten minZ to 0 in TEMP
           - insert into base feature (preferred) or fallback
         """
+        # If a prior attempt determined insertion is blocked in this environment, fail gracefully
+        if getattr(self, "_copy_blocked_reason", None):
+            return None  # Return None to skip this placement, don't crash the entire script
         try:
             target_comp = target_occ.component
             src = resolve_native(body)
 
+            def _log_copy(msg):
+                try:
+                    self.logger.log(msg)
+                except Exception:
+                    pass
+
             temp_mgr = adsk.fusion.TemporaryBRepManager.get()
             tmp = temp_mgr.copy(src)
             if not tmp:
+                _log_copy(f"⚠️  copy_via_temp_cookie_cutter: temp copy failed for body {getattr(body, 'name', 'unnamed')}")
                 return None
 
             if rotate_90:
@@ -227,7 +237,7 @@ class SheetNester:
                 # Dev-only fail-fast guard (disabled by default)
                 try:
                     try:
-                        from foamcam.config import Config
+                        from common.config import Config
                     except Exception:
                         try:
                             from .config import Config
@@ -239,6 +249,7 @@ class SheetNester:
                     pass
 
                 if not temp_mgr.transform(tmp, R):
+                    _log_copy(f"⚠️  copy_via_temp_cookie_cutter: rotation transform failed for {getattr(body, 'name', 'unnamed')}")
                     return None
 
             # flatten to Z=0
@@ -248,33 +259,99 @@ class SheetNester:
                 Tz = adsk.core.Matrix3D.create()
                 Tz.translation = adsk.core.Vector3D.create(0.0, 0.0, -minz)
                 if not temp_mgr.transform(tmp, Tz):
+                    _log_copy(f"⚠️  copy_via_temp_cookie_cutter: flatten transform failed for {getattr(body, 'name', 'unnamed')} minz={minz:.4f}")
                     return None
 
-            # Insert ladder
-            if base_feat:
+            # Insert ladder - branch by design type to avoid baseFeature in direct modeling
+            # Use the target component's parentDesign (self.design may be None in some contexts)
+            design_obj = getattr(target_comp, 'parentDesign', None) or getattr(self, 'design', None)
+            design_type = getattr(design_obj, 'designType', None)
+            is_parametric = design_type == getattr(adsk.fusion.DesignTypes, 'ParametricDesignType', None)
+
+            # If caller provided a base feature (rare), try it first in parametric mode only
+            if base_feat and is_parametric:
                 try:
                     return target_comp.bRepBodies.add(tmp, base_feat)
-                except:
-                    pass
+                except Exception as e:
+                    _log_copy(
+                        f"⚠️  copy_via_temp_cookie_cutter: base_feat add failed for {getattr(body, 'name', 'unnamed')}: {type(e).__name__}: {e}"
+                    )
 
-            try:
-                bf = target_comp.features.baseFeatures.add()
-                bf.startEdit()
-                nb = target_comp.bRepBodies.add(tmp, bf)
-                bf.finishEdit()
-                return nb
-            except:
+            # Parametric: use explicit base feature
+            if is_parametric:
                 try:
-                    if 'bf' in locals() and bf:
-                        bf.finishEdit()
-                except:
-                    pass
+                    bf = target_comp.features.baseFeatures.add()
+                    bf.startEdit()
+                    nb = bf.bRepBodies.add(tmp)
+                    bf.finishEdit()
+                    return nb
+                except Exception as e:
+                    _log_copy(
+                        f"⚠️  copy_via_temp_cookie_cutter: temp baseFeature add failed for {getattr(body, 'name', 'unnamed')}: {type(e).__name__}: {e}"
+                    )
+                    try:
+                        if 'bf' in locals() and bf:
+                            bf.finishEdit()
+                    except:
+                        pass
 
+            # Direct modeling: baseFeature is unsupported; try copyToComponent first (more tolerant)
+            server_copy_blocked = False
+            try:
+                nb_ctc = tmp.copyToComponent(target_comp)
+                if nb_ctc:
+                    return nb_ctc
+            except Exception as e:
+                _log_copy(
+                    f"⚠️  copy_via_temp_cookie_cutter: copyToComponent failed for {getattr(body, 'name', 'unnamed')}: {type(e).__name__}: {e}"
+                )
+                # Detect server-restricted execution; continue to other fallbacks
+                if "not supported on server" in str(e).lower():
+                    server_copy_blocked = True
+                    # Set a flag to disable void nesting entirely - it can't work without copy support
+                    if not hasattr(self, '_void_nesting_auto_disabled'):
+                        self._void_nesting_auto_disabled = True
+                        _log_copy("⚠️  AUTO-DISABLING VOID NESTING: copyToComponent not supported in this environment (cloud/server execution)")
+                        _log_copy("   Void nesting requires body copy operations which are unavailable. Continuing with standard packing only.")
+
+            # Fallback: direct add without base feature
+            direct_add_err = None
             try:
                 return target_comp.bRepBodies.add(tmp)
-            except:
+            except Exception as e:
+                direct_add_err = e
+                _log_copy(
+                    f"⚠️  copy_via_temp_cookie_cutter: direct add failed for {getattr(body, 'name', 'unnamed')}: {type(e).__name__}: {e}"
+                )
+                # If the environment unexpectedly demands a base feature, try creating one even in direct mode
+                try:
+                    bf2 = target_comp.features.baseFeatures.add()
+                    bf2.startEdit()
+                    nb2 = bf2.bRepBodies.add(tmp)
+                    bf2.finishEdit()
+                    return nb2
+                except Exception as e2:
+                    _log_copy(
+                        f"⚠️  copy_via_temp_cookie_cutter: emergency baseFeature add failed for {getattr(body, 'name', 'unnamed')}: {type(e2).__name__}: {e2}"
+                    )
+                    # If both direct add and emergency baseFeature fail, remember a concise reason to abort later
+                    blocked_msgs = []
+                    if server_copy_blocked:
+                        blocked_msgs.append("copyToComponent blocked on server")
+                    if isinstance(direct_add_err, Exception) and "targetbasefeature is required" in str(direct_add_err).lower():
+                        blocked_msgs.append("direct add demands base feature")
+                    if "not supported in direct modeling" in str(e2).lower():
+                        blocked_msgs.append("base feature rejected in direct modeling")
+
+                    if blocked_msgs:
+                        self._copy_blocked_reason = (
+                            "Insertion failed: " + "; ".join(blocked_msgs) + ". "
+                            "Run from the desktop Modeling workspace (history off/direct) or enable base features in parametric mode, then rerun."
+                        )
+                        raise RuntimeError(self._copy_blocked_reason)
                 return None
         except:
+            _log_copy(f"⚠️  copy_via_temp_cookie_cutter: unexpected exception for {getattr(body, 'name', 'unnamed')}")
             return None
 
     def _find_best_position_smart(self, 
@@ -507,6 +584,11 @@ class SheetNester:
             if it.name not in anchors and ((max_dim <= max_dim_cut) or (max_area <= max_area_cut)):
                 void_candidate_names.add(it.name)
 
+        # If environment auto-disabled void nesting, treat all parts as normal (no void-only list)
+        if getattr(self, '_void_nesting_auto_disabled', False) and void_candidate_names:
+            self.logger.log("🔧 Void nesting auto-disabled; treating all parts as normal items")
+            void_candidate_names.clear()
+
         self.logger.log(
             f"Nesting partition: anchors={len(anchors)} void_candidates={len(void_candidate_names)} total_items={len(items)}"
         )
@@ -526,12 +608,20 @@ class SheetNester:
             items.sort(key=group_sort_key)  # Python's sort is stable by default
             self.logger.log(f"Packing groups detected: {len(anchor_parts)} anchor parts will be placed first")
 
+        # Optionally allow cross-class packing: collapse to the largest sheet class
+        sheet_classes = list(self.Config.SHEET_CLASSES)
+        if getattr(self.Config, 'PACKING_ALLOW_CROSS_CLASS', False):
+            largest_sheet = max(sheet_classes, key=lambda t: t[1] * t[2])
+            sheet_classes = [largest_sheet]
+            for it in items:
+                it.sheet_class = largest_sheet[0]
+
         # Group by class
         groups = defaultdict(list)
         for it in items:
             groups[it.sheet_class].append(it)
 
-        class_order = {cname: i for i, (cname, _sw, _sh) in enumerate(self.Config.SHEET_CLASSES)}
+        class_order = {cname: i for i, (cname, _sw, _sh) in enumerate(sheet_classes)}
         
         # Process classes in order of their largest part (not predefined class order)
         # This ensures parts with voids get placed first across all classes
@@ -556,10 +646,14 @@ class SheetNester:
         
         # Track which sheet each part is placed on (for packing groups)
         part_to_sheet = {}  # Map of part_name -> sheet_name for group constraints
+        
+        # Global placement tracking: record exact position of every placed part
+        # This enables accurate cross-sheet void nesting by knowing actual placement locations
+        placement_registry = {}  # Map of part_name -> {'sheet_name': str, 'sheet_comp': component, 'sheet_occ': occurrence, 'position': (x,y), 'has_voids': bool}
 
         for cn in class_names_sorted:
             sw = sh = None
-            for cname, cw, ch in self.Config.SHEET_CLASSES:
+            for cname, cw, ch in sheet_classes:
                 if cname == cn:
                     sw, sh = cw, ch
                     break
@@ -591,6 +685,13 @@ class SheetNester:
                 enable_void_nesting = getattr(self.Config, 'ENABLE_VOID_NESTING', False)
                 allow_cross_void = getattr(self.Config, 'VOID_NESTING_ALLOW_CROSS_SHEETS', False)
                 
+                # Check if void nesting was auto-disabled due to environment restrictions
+                if enable_void_nesting and getattr(self, '_void_nesting_auto_disabled', False):
+                    enable_void_nesting = False
+                    self.logger.log("🔧 Void nesting disabled: body copy operations not supported in this environment")
+                
+                self.logger.log(f"🔧 Void nesting config: ENABLE_VOID_NESTING={enable_void_nesting}, ALLOW_CROSS_SHEETS={allow_cross_void}")
+                
                 if use_smart:
                     # Smart packing with best-fit positioning
                     occupied = []  # List of (x, y, w, h) for placed items
@@ -614,6 +715,14 @@ class SheetNester:
                     if idx % 10 == 0:
                         try: adsk.doEvents()
                         except: pass
+
+                    # Always resolve a fresh clean name per part to avoid stale logs
+                    clean_name = self._clean_part_name(it.name)
+                    
+                    # Skip items that have already been placed (via void nesting on earlier sheets)
+                    if it.name in part_to_sheet:
+                        self.logger.log(f"  Skipping {clean_name} (already placed on {part_to_sheet[it.name]})")
+                        continue
                     
                     # Check packing group constraints: if this part is in a group, 
                     # it can only be placed on the same sheet as its anchor (if anchor is already placed)
@@ -645,18 +754,128 @@ class SheetNester:
 
                     # build orientation tries                    # Try void nesting first if enabled and voids are available
                     # ONLY nest within CURRENT sheet in first pass (cross-sheet nesting happens in second pass)
+                    if enable_void_nesting and getattr(self, '_void_nesting_auto_disabled', False):
+                        enable_void_nesting = False
+                        allow_cross_void = False
+                        available_voids.clear()
+                        self.logger.log("🔧 Void nesting disabled mid-run; continuing with standard placement")
+                    
+                    # Track consumed voids globally (shared between first pass and second pass)
+                    if not hasattr(self, '_consumed_voids_tracker'):
+                        self._consumed_voids_tracker = []
+                    consumed_voids = self._consumed_voids_tracker
+                    
                     nested_in_void = False
                     if enable_void_nesting and available_voids:
                         from foamcam.geometry import can_fit_in_void
                         void_margin = getattr(self.Config, 'VOID_NESTING_MARGIN', 5.0)
+
+                        def _void_snapshot(void_entries):
+                            # Return compact summary: total count and top 3 by area
+                            flat = [(round(v['width_mm'], 1), round(v['height_mm'], 1), ve['sheet_name'])
+                                    for ve in void_entries for v in ve['voids']]
+                            flat.sort(key=lambda t: t[0] * t[1], reverse=True)
+                            return len(flat), flat[:3]
+
+                        # Track consumed voids to remove after iteration (avoid modifying during iteration)
+                        # consumed_voids is now shared across passes (defined above)
                         
+                        def _place_into_void(it_obj, fp_obj, rot_obj, v_entry, void, target_comp, target_occ, target_name, target_list):
+                            """Place a part into a specific void (cross-sheet aware)."""
+                            if getattr(self, '_void_nesting_auto_disabled', False):
+                                return False
+                            nb_local = None
+                            try:
+                                nb_local = self._copy_via_temp_cookie_cutter(it_obj.body, target_occ, rotate_90=rot_obj, base_feat=None)
+                                if not nb_local:
+                                    self.logger.log(f"  ⚠️  Void placement copy failed for {it_obj.name} on {target_name}")
+                                    return False
+
+                                try:
+                                    nb_local.name = self._clean_part_name(it_obj.name)
+                                except:
+                                    pass
+
+                                void_bbox = void['bbox_mm']
+                                void_center_x = (void_bbox[0] + void_bbox[2]) * 0.5
+                                void_center_y = (void_bbox[1] + void_bbox[3]) * 0.5
+
+                                x0,y0,z0,x1,y1,z1 = bbox_mm(nb_local)
+                                part_center_x = (x0 + x1) * 0.5
+                                part_center_y = (y0 + y1) * 0.5
+
+                                # Use placement registry to get accurate container position
+                                # If void container is registered, use its actual position; otherwise fall back to offset
+                                container_body_name = v_entry['body_name']
+                                if container_body_name in placement_registry:
+                                    reg_entry = placement_registry[container_body_name]
+                                    if reg_entry['sheet_name'] == target_name:
+                                        # Same sheet: use stored offset (normal case)
+                                        offset_x, offset_y = v_entry['offset']
+                                        tx = (offset_x + void_center_x) - part_center_x
+                                        ty = (offset_y + void_center_y) - part_center_y
+                                    else:
+                                        # Cross-sheet: use registry position which is in absolute coordinates
+                                        offset_x, offset_y = reg_entry['position']
+                                        tx = (offset_x + void_center_x) - part_center_x
+                                        ty = (offset_y + void_center_y) - part_center_y
+                                else:
+                                    # Fallback: use stored offset (part not yet in registry)
+                                    offset_x, offset_y = v_entry['offset']
+                                    tx = (offset_x + void_center_x) - part_center_x
+                                    ty = (offset_y + void_center_y) - part_center_y
+                                
+                                tz = -max(z0, z1)
+
+                                # Sanity: ensure translated bbox will stay within sheet usable area
+                                # Use stored usable_w/h from void entry; fall back to current sheet if missing
+                                uw = v_entry.get('usable_w', usable_w)
+                                uh = v_entry.get('usable_h', usable_h)
+                                new_x0 = x0 + tx
+                                new_x1 = x1 + tx
+                                new_y0 = y0 + ty
+                                new_y1 = y1 + ty
+                                if (new_x0 < -1e-3 or new_y0 < -1e-3 or
+                                    new_x1 > uw + 1e-3 or new_y1 > uh + 1e-3):
+                                    self.logger.log(
+                                        f"  ⚠️  Void placement rejected for {it_obj.name} on {target_name}: out of bounds after translation"
+                                    )
+                                    try: nb_local.deleteMe()
+                                    except: pass
+                                    return False
+
+                                move_translate_only(target_comp, nb_local, tx, ty, tz)
+
+                                target_list.append({
+                                    'name': self._clean_part_name(it_obj.name),
+                                    'width': fp_obj.w_mm,
+                                    'height': fp_obj.h_mm
+                                })
+
+                                # Mark void as consumed (remove after iteration completes)
+                                consumed_voids.append((v_entry, void))
+
+                                part_to_sheet[it_obj.name] = target_name
+                                return True
+                            except Exception as e:
+                                self.logger.log(f"  ⚠️  Void placement error for {it_obj.name} on {target_name}: {type(e).__name__}: {e}")
+                                if nb_local:
+                                    try: nb_local.deleteMe()
+                                    except: pass
+                                return False
+
+                        tried_orients = []
+                        best_miss = None  # Track the closest-to-fitting void for diagnostics
                         for rot, fp in [(False, it.fp0)] + ([(True, it.fp1)] if it.fp1 else []):
                             if nested_in_void:
                                 break
                             w, h = fp.w_mm, fp.h_mm
-                            
+                            tried_orients.append((rot, round(w, 1), round(h, 1)))
+                            before_count, before_sample = _void_snapshot(available_voids)
+
                             for void_entry in available_voids:
                                 # FIRST PASS: allow same-sheet; optionally allow cross-sheet void usage
+                                # Default to current sheet; may be overridden for cross-sheet void use
                                 target_sheet_comp = sheet_comp
                                 target_sheet_occ = sheet_occ
                                 target_sheet_name = sheet_name
@@ -673,63 +892,55 @@ class SheetNester:
                                 
                                 for void in void_entry['voids']:
                                     fits = can_fit_in_void(w, h, void, void_margin)
+                                    if fits:
+                                        self.logger.log(f"     ✅ {clean_name} FITS in void {void['width_mm']:.0f}×{void['height_mm']:.0f} (part {w:.0f}×{h:.0f}) on {target_sheet_name}")
                                     if not fits:
-                                        if target_sheet_comp != sheet_comp:
-                                            self.logger.log(
-                                                f"  Void skip: {self._clean_part_name(it.name)} {w:.1f}x{h:.1f} vs void {void['width_mm']:.1f}x{void['height_mm']:.1f} on {target_sheet_name} (margin={void_margin})"
-                                            )
+                                        # Remember best near-miss to explain rejection later
+                                        dx = void['width_mm'] - (w + 2 * void_margin)
+                                        dy = void['height_mm'] - (h + 2 * void_margin)
+                                        miss_score = min(dx, dy)
+                                        if (best_miss is None) or (miss_score > best_miss[-1]):
+                                            best_miss = (rot, round(w, 1), round(h, 1),
+                                                         round(void['width_mm'], 1), round(void['height_mm'], 1),
+                                                         round(dx, 1), round(dy, 1), miss_score)
                                         continue
-                                    try:
-                                        nb = self._copy_via_temp_cookie_cutter(it.body, target_sheet_occ, rotate_90=rot, base_feat=None)
-                                        if not nb:
-                                            continue
-                                        
-                                        clean_name = self._clean_part_name(it.name)
-                                        try:
-                                            nb.name = clean_name
-                                        except:
-                                            pass
-                                        
-                                        # Position inside void
-                                        void_bbox = void['bbox_mm']
-                                        void_center_x = (void_bbox[0] + void_bbox[2]) * 0.5
-                                        void_center_y = (void_bbox[1] + void_bbox[3]) * 0.5
-                                        
-                                        x0,y0,z0,x1,y1,z1 = bbox_mm(nb)
-                                        part_center_x = (x0 + x1) * 0.5
-                                        part_center_y = (y0 + y1) * 0.5
-                                        
-                                        offset_x, offset_y = void_entry['offset']
-                                        tx = (offset_x + void_center_x) - part_center_x
-                                        ty = (offset_y + void_center_y) - part_center_y
-                                        tz = -max(z0, z1)
-                                        
-                                        move_translate_only(target_sheet_comp, nb, tx, ty, tz)
-                                        
-                                        target_part_list.append({
-                                            'name': clean_name,
-                                            'width': fp.w_mm,
-                                            'height': fp.h_mm
-                                        })
-                                        
-                                        # Track which sheet this part was placed on (for packing groups)
-                                        part_to_sheet[it.name] = target_sheet_name
+                                    placed_ok = _place_into_void(it, fp, rot, void_entry, void, target_sheet_comp, target_sheet_occ, target_sheet_name, target_part_list)
+                                    if placed_ok:
                                         if self._get_packing_group_members(it.name):
                                             self.logger.log(f"  Placed anchor part {it.name} on {target_sheet_name} (via void nesting)")
-                                        
                                         self.logger.log(f"  Nested {clean_name} ({w:.1f}x{h:.1f}) inside {void_entry['body_name']} on {target_sheet_name}")
                                         placed_any = True
                                         if target_sheet_comp == sheet_comp:
                                             placed_here_count += 1
                                         nested_in_void = True
                                         break
-                                    except:
-                                        if nb:
-                                            try: nb.deleteMe()
-                                            except: pass
-                                        continue
                                 if nested_in_void:
                                     break
+                            
+                            after_count, after_sample = _void_snapshot(available_voids)
+                            if before_count != after_count or before_sample != after_sample:
+                                self.logger.log(
+                                    f"  DEBUG: {it.name} rot={rot} size={w:.1f}x{h:.1f} voids before={before_count} after={after_count} sample_before={before_sample} sample_after={after_sample}"
+                                )
+                        if not nested_in_void:
+                            total_count, total_sample = _void_snapshot(available_voids)
+                            self.logger.log(
+                                f"  DEBUG: {it.name} no void fit (pass1); tried={tried_orients} voids={total_count} sample={total_sample}"
+                            )
+                            if best_miss:
+                                rot, bw, bh, vw, vh, dx, dy, _ = best_miss
+                                self.logger.log(
+                                    f"  DEBUG: best miss rot={rot} part={bw}x{bh} void={vw}x{vh} slack=({dx},{dy}) margin={void_margin}"
+                                )
+                        
+                        # Clean up consumed voids after all void placement attempts for this part
+                        for v_entry, void in consumed_voids[:]:
+                            if void in v_entry['voids']:
+                                v_entry['voids'].remove(void)
+                        # Remove empty void entries
+                        available_voids[:] = [ve for ve in available_voids if ve['voids']]
+                        # Clear consumed_voids for next part
+                        consumed_voids.clear()
                     
                     if nested_in_void:
                         continue  # Skip normal placement, already nested
@@ -803,6 +1014,9 @@ class SheetNester:
                         
                         # Track which sheet this part was placed on (for packing groups)
                         part_to_sheet[it.name] = sheet_name
+                        
+                        # Register placement in global registry
+                        has_voids_flag = False
                         if self._get_packing_group_members(it.name):
                             self.logger.log(f"  Placed anchor part {it.name} on {sheet_name}")
 
@@ -810,8 +1024,9 @@ class SheetNester:
                         if enable_void_nesting:
                             try:
                                 from foamcam.geometry import detect_internal_voids
-                                voids = detect_internal_voids(nb)
+                                voids = detect_internal_voids(nb, logger=self.logger)
                                 if voids:
+                                    has_voids_flag = True
                                     # Store void info with body reference, placement offset, and sheet context
                                     available_voids.append({
                                         'body': nb,
@@ -821,11 +1036,27 @@ class SheetNester:
                                         'sheet_name': sheet_name,
                                         'sheet_comp': sheet_comp,  # Store component reference for cross-sheet nesting
                                         'sheet_occ': sheet_occ,
-                                        'part_names_list': placed_part_names
+                                        'part_names_list': placed_part_names,
+                                        'usable_w': usable_w,
+                                        'usable_h': usable_h,
                                     })
                                     self.logger.log(f"  Found {len(voids)} void(s) in {clean_name} for potential nesting")
+                                else:
+                                    self.logger.log(f"  No voids detected in {clean_name}")
                             except Exception as e:
-                                pass  # Silently continue if void detection fails
+                                self.logger.log(f"  ⚠️  Void detection error for {clean_name}: {e}")
+                                import traceback
+                                self.logger.log(f"     Traceback: {traceback.format_exc()}")
+                        
+                        # Register this part's placement in global registry
+                        placement_registry[it.name] = {
+                            'sheet_name': sheet_name,
+                            'sheet_comp': sheet_comp,
+                            'sheet_occ': sheet_occ,
+                            'position': (self.margin + place_x, self.margin + place_y),
+                            'has_voids': has_voids_flag
+                        }
+                        
                         # Update state based on packing mode
                         if use_smart:
                             occupied.append((place_x, place_y, w, h))
@@ -851,9 +1082,25 @@ class SheetNester:
                     void_margin = getattr(self.Config, 'VOID_NESTING_MARGIN', 5.0)
                     
                     still_remaining = []
+
+                    def _void_snapshot(void_entries):
+                        flat = [(round(v['width_mm'], 1), round(v['height_mm'], 1), ve['sheet_name'])
+                                for ve in void_entries for v in ve['voids']]
+                        flat.sort(key=lambda t: t[0] * t[1], reverse=True)
+                        return len(flat), flat[:3]
+
                     for it in next_remaining:
-                        nested = False
+                        clean_name = self._clean_part_name(it.name)
                         
+                        # Safety check: skip if already placed (via cross-sheet void nesting in first pass)
+                        if it.name in part_to_sheet:
+                            still_remaining.append(it)
+                            continue
+                        
+                        nested = False
+                        best_miss = None  # Capture closest miss for diagnostics
+                        before_count, before_sample = _void_snapshot(available_voids)
+
                         # Try both orientations
                         for rot, fp in [(False, it.fp0)] + ([(True, it.fp1)] if it.fp1 else []):
                             if nested:
@@ -876,63 +1123,51 @@ class SheetNester:
                                 
                                 for void in void_entry['voids']:
                                     fits = can_fit_in_void(w, h, void, void_margin)
+                                    if fits:
+                                        self.logger.log(f"     ✅ {clean_name} FITS in void {void['width_mm']:.0f}×{void['height_mm']:.0f} (part {w:.0f}×{h:.0f}) on {target_sheet_name}")
                                     if not fits:
-                                        if target_sheet_comp != sheet_comp:
-                                            self.logger.log(
-                                                f"    Void skip: {self._clean_part_name(it.name)} {w:.1f}x{h:.1f} vs void {void['width_mm']:.1f}x{void['height_mm']:.1f} on {target_sheet_name} (margin={void_margin})"
-                                            )
+                                        dx = void['width_mm'] - (w + 2 * void_margin)
+                                        dy = void['height_mm'] - (h + 2 * void_margin)
+                                        miss_score = min(dx, dy)
+                                        if (best_miss is None) or (miss_score > best_miss[-1]):
+                                            best_miss = (rot, round(w, 1), round(h, 1),
+                                                         round(void['width_mm'], 1), round(void['height_mm'], 1),
+                                                         round(dx, 1), round(dy, 1), miss_score)
                                         continue
-                                    try:
-                                        nb = self._copy_via_temp_cookie_cutter(it.body, target_sheet_occ, rotate_90=rot, base_feat=None)
-                                        if not nb:
-                                            continue
-                                        
-                                        clean_name = self._clean_part_name(it.name)
-                                        try:
-                                            nb.name = clean_name
-                                        except:
-                                            pass
-                                        
-                                        # Position inside void (center of void bbox)
-                                        void_bbox = void['bbox_mm']
-                                        void_center_x = (void_bbox[0] + void_bbox[2]) * 0.5
-                                        void_center_y = (void_bbox[1] + void_bbox[3]) * 0.5
-                                        
-                                        x0,y0,z0,x1,y1,z1 = bbox_mm(nb)
-                                        part_center_x = (x0 + x1) * 0.5
-                                        part_center_y = (y0 + y1) * 0.5
-                                        
-                                        # Translate to center of void + parent offset
-                                        offset_x, offset_y = void_entry['offset']
-                                        tx = (offset_x + void_center_x) - part_center_x
-                                        ty = (offset_y + void_center_y) - part_center_y
-                                        tz = -max(z0, z1)
-                                        
-                                        move_translate_only(target_sheet_comp, nb, tx, ty, tz)
-                                        
-                                        # Track nested part
-                                        target_part_list.append({
-                                            'name': clean_name,
-                                            'width': fp.w_mm,
-                                            'height': fp.h_mm
-                                        })
-                                        
+                                    placed_ok = _place_into_void(it, fp, rot, void_entry, void, target_sheet_comp, target_sheet_occ, target_sheet_name, target_part_list)
+                                    if placed_ok:
                                         self.logger.log(f"    Nested {clean_name} ({w:.1f}x{h:.1f}) inside {void_entry['body_name']} on {target_sheet_name}")
-                                        part_to_sheet[it.name] = target_sheet_name
                                         placed_any = True
                                         if target_sheet_comp == sheet_comp:
                                             placed_here_count += 1
                                         nested = True
                                         break
-                                    except Exception as e:
-                                        if nb:
-                                            try: nb.deleteMe()
-                                            except: pass
-                                        continue
                                 if nested:
                                     break
-                        
+
+                        # Clean up consumed voids after each part is processed
+                        for v_entry, void in consumed_voids[:]:  # Use slice to avoid modification issues
+                            if void in v_entry['voids']:
+                                v_entry['voids'].remove(void)
+                            consumed_voids.remove((v_entry, void))
+                        # Remove empty void entries
+                        available_voids[:] = [ve for ve in available_voids if ve['voids']]
+
+                        after_count, after_sample = _void_snapshot(available_voids)
+                        if nested and (before_count != after_count or before_sample != after_sample):
+                            self.logger.log(
+                                f"    DEBUG: {it.name} nested rot={rot} voids before={before_count} after={after_count} sample_before={before_sample} sample_after={after_sample}"
+                            )
                         if not nested:
+                            # Log once per part if no void fit, compact summary
+                            self.logger.log(
+                                f"    DEBUG: {it.name} no void fit; voids={before_count} sample={before_sample}"
+                            )
+                            if best_miss:
+                                rot, bw, bh, vw, vh, dx, dy, _ = best_miss
+                                self.logger.log(
+                                    f"    DEBUG: best miss rot={rot} part={bw}x{bh} void={vw}x{vh} slack=({dx},{dy}) margin={void_margin}"
+                                )
                             still_remaining.append(it)
                     
                     # Update remaining list and log results
@@ -990,6 +1225,8 @@ class SheetNester:
         # These are parts that were marked as void_candidates but couldn't be placed
         placed_names = set(part_to_sheet.keys())
         void_candidates = [it for it in items if it.name in void_candidate_names and it.name not in placed_names]
+        if getattr(self, '_void_nesting_auto_disabled', False):
+            void_candidates = []
         
         # Preserve void_candidate_names for accounting (these are ALL parts that were marked as candidates)
         all_void_candidate_items = [it for it in items if it.name in void_candidate_names]
@@ -999,6 +1236,12 @@ class SheetNester:
         # Coverage check: every candidate should have been placed somewhere
         # After primary placement, optionally back-fill all known voids with deferred small parts
         enable_backfill = getattr(self.Config, 'ENABLE_BACKFILL_VOID_PASS', True)
+        
+        # Skip void backfill if auto-disabled due to environment restrictions
+        if enable_backfill and getattr(self, '_void_nesting_auto_disabled', False):
+            enable_backfill = False
+            available_voids = []
+            
         if enable_backfill and getattr(self.Config, 'ENABLE_VOID_NESTING', False) and available_voids and void_candidates:
             from foamcam.geometry import can_fit_in_void
             void_margin = getattr(self.Config, 'VOID_NESTING_MARGIN', 2.0)
@@ -1134,6 +1377,21 @@ class SheetNester:
                         offset_x, offset_y = v_entry['offset']
                         tx = (offset_x + void_center_x) - part_center_x
                         ty = (offset_y + void_center_y) - part_center_y
+                        # Bounds sanity for fallback case
+                        uw = v_entry.get('usable_w', usable_w)
+                        uh = v_entry.get('usable_h', usable_h)
+                        new_x0 = x0 + tx
+                        new_x1 = x1 + tx
+                        new_y0 = y0 + ty
+                        new_y1 = y1 + ty
+                        if (new_x0 < -1e-3 or new_y0 < -1e-3 or
+                            new_x1 > uw + 1e-3 or new_y1 > uh + 1e-3):
+                            self.logger.log(
+                                f"  ⚠️  Void placement rejected (fallback) for {it_obj.name} on {target_name}: out of bounds after translation"
+                            )
+                            try: nb_local.deleteMe()
+                            except: pass
+                            return False
                         tz = -max(z0, z1)
 
                         try:
@@ -1199,12 +1457,12 @@ class SheetNester:
             for it in void_candidates:
                 fallback_groups[it.sheet_class].append(it)
 
-            class_order = {cname: i for i, (cname, _sw, _sh) in enumerate(self.Config.SHEET_CLASSES)}
+            class_order = {cname: i for i, (cname, _sw, _sh) in enumerate(sheet_classes)}
             leftover = []  # any parts still unplaced after fallback
 
             for cn in sorted(fallback_groups.keys(), key=lambda k: class_order.get(k, 999)):
                 sw = sh = None
-                for cname, cw, ch in self.Config.SHEET_CLASSES:
+                for cname, cw, ch in sheet_classes:
                     if cname == cn:
                         sw, sh = cw, ch
                         break
@@ -1241,6 +1499,11 @@ class SheetNester:
                     x = y = row_h = 0.0
 
                     for it in remaining_fb:
+                        # Safety check: skip if already placed (should not happen, but prevent double-placement)
+                        if it.name in part_to_sheet:
+                            next_remaining_fb.append(it)
+                            continue
+                        
                         tries = []
                         if it.prefer_rot and self.Config.ALLOW_ROTATE_90 and it.fp1 is not None:
                             tries = [(True, it.fp1), (False, it.fp0)]

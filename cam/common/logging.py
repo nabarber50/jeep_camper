@@ -19,6 +19,32 @@ class AppLogger(object):
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {msg}"
 
+        # Optional compact mode: skip noisy debug/diagnostic lines when enabled
+        try:
+            from common.config import Config
+        except Exception:
+            try:
+                from .config import Config
+            except Exception:
+                Config = None
+        try:
+            if Config and getattr(Config, 'LOG_COMPACT', False):
+                stripped = msg.lstrip()
+                suppress_prefixes = (
+                    'DEBUG:',
+                    '🔍',
+                    'VOID DETECTION',
+                    'Edge types',
+                    'Raw bbox',
+                    'Raw dimensions',
+                    'Buffer=',
+                )
+                if stripped.startswith(suppress_prefixes):
+                    return
+        except Exception:
+            # Do not let compact filtering break logging
+            pass
+
         try:
             self._ensure_dir()
             with open(self.path, "a+", encoding="utf-8") as f:
@@ -42,7 +68,7 @@ class AppLogger(object):
 
                         # If configured, fail-fast so user sees traceback in console
                         try:
-                            from foamcam.config import Config
+                            from common.config import Config
                         except Exception:
                             try:
                                 from .config import Config
