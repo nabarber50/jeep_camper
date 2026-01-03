@@ -177,6 +177,10 @@ def run(context):
 
         # Panelize in new design
         logger.log("Panelizing into new design...")
+        
+        # Use the same log folder as the main log (already exists)
+        log_folder = os.path.dirname(log_path) if log_path else None
+        
         result = panelizer_core.panelize_step_into_new_design(
             app=app,
             ui=ui,
@@ -184,7 +188,8 @@ def run(context):
             capture_expr=CAPTURE_DEPTH,
             panel_priority=PANEL_PRIORITY,
             keep_tools_visible=KEEP_TOOL_SLABS_VISIBLE,
-            source_camera=app.activeViewport.camera
+            source_camera=app.activeViewport.camera,
+            log_folder=log_folder
         )
         logger.log(f"panelize result: {result}")
 
